@@ -103,7 +103,7 @@ class Scheduler(ABC):
         else:
             return self.results[job].get(i)
 
-    def report(self, job: Job = None) -> str:
+    def report(self, job: Job = None, array_idx: int = None) -> str:
         if job is None:
             headers = ("Name", "State")
             rows = [(str(job), self.state(job)) for job in self.order]
@@ -119,6 +119,11 @@ class Scheduler(ABC):
                 rows = [(str(job), self.state(job), self.output(job))]
             else:
                 array = sorted(job.array)
+                print("array", array)
+                if array_idx is not None:
+                    if array_idx not in array:
+                        raise UserWarning(f"Job {job} has no array index {array_idx}.")
+                    array = [array_idx]
                 rows = [
                     (f"{job.name}[{i}]", self.state(job, i), self.output(job, i)) for i in array
                 ]
@@ -380,12 +385,12 @@ class SlurmScheduler(Scheduler):
             logfile = self.path / f"{tag}_{i}.log"
 
         if logfile.exists():
-            with open(logfile, newline="") as f:
+            with open(logfile, newline="", errors="ignore") as f:
                 return f.read()
         else:
             return None
 
-    def report(self, job: Job = None) -> str:
+    def report(self, job: Job = None, array_idx: int = None) -> str:
         if job is None:
             headers = ("Name", "ID", "State")
             rows = []
@@ -400,7 +405,7 @@ class SlurmScheduler(Scheduler):
 
             return tabulate(rows, headers, showindex=True)
         else:
-            return super().report(job)
+            return super().report(job, array_idx)
 
     def cancel(self, job: Job = None) -> str:
         if job is None:

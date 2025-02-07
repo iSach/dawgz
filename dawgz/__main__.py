@@ -9,7 +9,7 @@ from typing import List
 from .schedulers import DIR, Scheduler
 
 
-def table(workflows: List[List[str]], workflow: int = None, job: int = None):
+def table(workflows: List[List[str]], workflow: int = None, job: int = None, array: int = None):
     if workflow is None:
         headers = ("Name", "ID", "Date", "Backend", "Jobs", "Errors")
         rows = [(w[0], w[1][:8], *w[2:]) for w in workflows]
@@ -25,9 +25,7 @@ def table(workflows: List[List[str]], workflow: int = None, job: int = None):
         else:
             jobs = list(scheduler.order)
             job = jobs[job]
-
-            table = scheduler.report(job)
-
+            table = scheduler.report(job, array)
     print(table)
 
 
@@ -54,6 +52,7 @@ def main():
 
     parser.add_argument("workflow", default=None, nargs="?", type=int, help="workflow index")
     parser.add_argument("job", default=None, nargs="?", type=int, help="job index")
+    parser.add_argument("array", default=None, nargs="?", type=int, help="array index")
 
     parser.add_argument("-c", "--cancel", default=False, action="store_true")
 
@@ -70,9 +69,9 @@ def main():
 
     # Action
     if args.cancel:
-        cancel(workflows, args.workflow, args.job)
+        cancel(workflows, args.workflow, args.job, args.array)
     else:
-        table(workflows, args.workflow, args.job)
+        table(workflows, args.workflow, args.job, args.array)
 
 
 if __name__ == "__main__":
