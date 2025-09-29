@@ -17,6 +17,7 @@ from functools import lru_cache, partial
 from inspect import isawaitable
 from pathlib import Path
 from random import random
+from networkx import truncated_tetrahedron_graph
 from tabulate import tabulate
 from typing import Any, Callable, Dict, Sequence
 
@@ -103,7 +104,7 @@ class Scheduler(ABC):
         else:
             return self.results[job].get(i)
 
-    def report(self, job: Job = None, array_idx: int = None) -> str:
+    def report(self, job: Job = None, array: int = None, expand: bool = False) -> str:
         if job is None:
             headers = ("Name", "State")
             rows = [(str(job), self.state(job)) for job in self.order]
@@ -116,16 +117,16 @@ class Scheduler(ABC):
             if job in self.traces:
                 rows = [(str(job), self.state(job), self.traces[job])]
             elif job.array is None:
-                rows = [(str(job), self.state(job), self.output(job))]
+                if expand:
+                    rows = [(str(job), self.state(job), self.output(job))]
+                else:
+                    rows = [
+                        (f"{job.name}[{i}]", self.state(job, i), self.output_lastline(job, i)) for i in array
+                    ]
             else:
                 array = sorted(job.array)
-                #print("array", array)
-                if array_idx is not None:
-                    if array_idx not in array:
-                        raise UserWarning(f"Job {job} has no array index {array_idx}.")
-                    array = [array_idx]
                 rows = [
-                    (f"{job.name}[{i}]", self.state(job, i), self.output(job, i)) for i in array
+                    (f"{job.name}[{i}]", self.state(job, i), self.output(job, i) if expand else self.output_lastline(job, i)) for i in array
                 ]
 
             rows = [
@@ -324,7 +325,7 @@ class SlurmScheduler(Scheduler):
         self,
         name: str = None,
         shell: str = os.environ.get("SHELL", "/bin/sh"),
-        interpreter: str = None,
+        interpreter: str = "python",
         env: Sequence[str] = [],  # noqa: B006
         **kwargs,
     ):
@@ -332,7 +333,7 @@ class SlurmScheduler(Scheduler):
         Arguments:
             name: The name of the workflow.
             shell: The scripting shell.
-            interpreter: The Python interpreter. If not None, overrides jobs' interpreters.
+            interpreter: The Python interpreter.
             env: A sequence of commands to execute before each job is launched.
             kwargs: Keyword arguments passed to :class:`Scheduler`.
         """
@@ -376,6 +377,28 @@ class SlurmScheduler(Scheduler):
         else:
             return None
 
+    def output_lastline(self, job: Job, i: int = None) -> str:
+        tag = self.tag(job)
+
+        if job.array is None:
+            logfile = self.path / f"{tag}.log"
+        else:
+            logfile = self.path / f"{tag}_{i}.log"
+
+        if logfile.exists():
+            try:
+                cmd_out = subprocess.check_output(
+                    f"awk '/^[[:space:]]*$/ {{ in_resources = 1 }} !in_resources' {str(logfile.absolute())} | tac | grep -Ua --binary-files=text -m 1 . --color=never | tr '\r' '\n' | awk 'NF' | tail -n 1",
+                    text=True,
+                    shell=True
+                )
+            except:
+                cmd_out = None
+
+            return cmd_out
+        else:
+            return None
+
     def output(self, job: Job, i: int = None) -> str:
         tag = self.tag(job)
 
@@ -390,9 +413,9 @@ class SlurmScheduler(Scheduler):
         else:
             return None
 
-    def report(self, job: Job = None, array_idx: int = None) -> str:
+    def report(self, job: Job = None, array: int = None, expand: bool = True) -> str:
         if job is None:
-            headers = ("Name", "ID", "State")
+            headers = ("Name", "ID", "State", "Output")
             rows = []
 
             for job in self.order:
@@ -401,11 +424,19 @@ class SlurmScheduler(Scheduler):
                 else:
                     jobid = self.results[job]
 
-                rows.append((str(job), jobid, self.state(job)))
+                out = ""
+                if job.array:
+                    for i in job.array:
+                        #print(jobid, job, i, self.output_lastline(job, i))
+                        if self.state(job, i) is None:
+                            break
+                        out = self.output_lastline(job, i)
+
+                rows.append((str(job), jobid, self.state(job), out))
 
             return tabulate(rows, headers, showindex=True)
         else:
-            return super().report(job, array_idx)
+            return super().report(job, array, expand=expand)
 
     def cancel(self, job: Job = None) -> str:
         if job is None:
@@ -459,16 +490,24 @@ class SlurmScheduler(Scheduler):
 
         assert "clusters" not in settings, "multi-cluster jobs not supported"
 
-        for key in settings:
-            assert not key.startswith("ntasks"), "multi-task jobs not supported"
+        #for key in settings:
+        #    assert not key.startswith("ntasks"), "multi-task jobs not supported"
 
-        nodes = settings.pop("nodes", 1)
 
         lines.append("#")
-        lines.append("#SBATCH --nodes=" + f"{nodes}")
-        lines.append("#SBATCH --ntasks-per-node=1")
 
-        print(settings)
+        if "ntasks" in settings:
+            if "gpus" in settings:
+                lines.append("#SBATCH --gpus-per-task=1")
+                settings.pop("gpus")
+            lines.append(f"#SBATCH --ntasks={settings.pop('ntasks')}")
+        else:
+            nodes = settings.pop("nodes", 1)
+            lines.append("#SBATCH --nodes=" + f"{nodes}")
+            lines.append("#SBATCH --ntasks-per-node=1")
+
+        lines.append("#SBATCH --dependency=afterany:10229168_1")
+
         for key, value in settings.items():
             key = self.translate.get(key, key)
 
@@ -495,6 +534,8 @@ class SlurmScheduler(Scheduler):
             lines.append("#SBATCH --dependency=" + sep.join(deps))
 
         lines.append("")
+
+        print("\n".join(lines))
 
         ## Environment
         if self.env:
@@ -528,12 +569,15 @@ class SlurmScheduler(Scheduler):
                 ])
             )
 
-        if self.interpreter is not None:
+        print("job int", job.interpreter)
+        print("self int", self.interpreter)
+
+        if job.interpreter is None:
             interpreter = self.interpreter
         else:
             interpreter = job.interpreter
 
-        print(job.name, interpreter)
+        print("-> interpreter", interpreter)
 
         if job.array is None:
             lines.append(f"srun {interpreter} {pyfile}")
