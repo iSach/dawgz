@@ -24,6 +24,24 @@ SACCT_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
 SACCT_TTL: float = 5.0  # seconds
 
 
+async def run(*args: str) -> str:
+    r"""Runs a command asynchronously and returns its standard output."""
+
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(
+            process.returncode, args, stdout.decode(), stderr.decode()
+        )
+
+    return stdout.decode()
+
+
 class SlurmScheduler(Scheduler):
     r"""Slurm scheduler.
 
@@ -46,25 +64,35 @@ class SlurmScheduler(Scheduler):
     }
 
     @staticmethod
-    def sacct(jobid: str) -> dict[str, str]:
+    def sacct(*jobids: str) -> dict[str, str]:
         now = time.monotonic()
-        then, states = SACCT_CACHE.get(jobid, (float("-inf"), None))
 
-        if now < then + SACCT_TTL:
-            return states
+        stale = [
+            jobid
+            for jobid in dict.fromkeys(jobids)
+            if now >= SACCT_CACHE.get(jobid, (float("-inf"), None))[0] + SACCT_TTL
+        ]
 
-        text = subprocess.run(
-            ["sacct", "-j", jobid, "-o", "JobID,State", "-n", "-P", "-X"],
-            capture_output=True,
-            check=True,
-            text=True,
-        ).stdout.strip("\n")
+        if stale:
+            # Fetch all stale jobs in a single sacct call
+            text = subprocess.run(
+                ["sacct", "-j", ",".join(stale), "-o", "JobID,State", "-n", "-P", "-X"],
+                capture_output=True,
+                check=True,
+                text=True,
+            ).stdout.strip("\n")
 
-        states = dict(line.split("|") for line in text.splitlines())
+            states = dict(line.split("|") for line in text.splitlines()) if text else {}
 
-        SACCT_CACHE[jobid] = (now, states)
+            for jobid in stale:
+                SACCT_CACHE[jobid] = (now, states)
 
-        return states
+        table = {}
+
+        for jobid in jobids:
+            table.update(SACCT_CACHE.get(jobid, (None, None))[1] or {})
+
+        return table
 
     def state(self, job: Job, i: int | None = None) -> str:
         if job in self.traces:
@@ -103,6 +131,8 @@ class SlurmScheduler(Scheduler):
             table.add_column("Job", justify="left", no_wrap=True)
             table.add_column("State", justify="left", no_wrap=True)
             table.add_column("ID", justify="right", no_wrap=True)
+
+            self.sacct(*self.results.values())  # prefetch all job states in one call
 
             for job, i in self.order.items():  # noqa: PLR1704
                 if job in self.traces:
@@ -248,12 +278,7 @@ class SlurmScheduler(Scheduler):
 
         # Submit script
         try:
-            text = subprocess.run(
-                ["sbatch", "--parsable", str(shfile)],
-                capture_output=True,
-                check=True,
-                text=True,
-            ).stdout
+            text = await run("sbatch", "--parsable", str(shfile))
 
             jobid, *_ = text.strip("\n").split(";")  # ignore cluster name
 

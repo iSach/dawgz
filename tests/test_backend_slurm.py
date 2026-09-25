@@ -39,6 +39,31 @@ def squeue() -> dict[str, str]:
 @pytest.fixture(autouse=True)
 def mock_subprocess_run(squeue: dict) -> Generator[MagicMock]:
     def run(cmd: list[str], **ignore) -> subprocess.CompletedProcess[str]:
+        if cmd[0] == "scancel":
+            prefixes = cmd[2:]
+
+            for jobid in squeue:
+                if any(jobid.startswith(prefix) for prefix in prefixes):
+                    squeue[jobid] = "CANCELLED"
+
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="terminating job\n", stderr=""
+            )
+        elif cmd[0] == "sacct":
+            prefixes = cmd[2].split(",")
+            lines = []
+
+            for jobid, status in squeue.items():
+                if any(jobid.startswith(prefix) for prefix in prefixes):
+                    lines.append(f"{jobid}|{status}")
+
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="\n".join(lines) + "\n", stderr=""
+            )
+        else:
+            raise NotImplementedError(f"Unknown command {cmd[0]}")
+
+    async def exec(*cmd: str, **ignore) -> "FakeProcess":
         if cmd[0] == "sbatch":
             with open(cmd[-1]) as shfile:
                 match = re.search(r"--array=(\d+)-(\d+)", shfile.read())
@@ -55,34 +80,23 @@ def mock_subprocess_run(squeue: dict) -> Generator[MagicMock]:
                 for i in array:
                     squeue[f"{jobid}_{i}"] = "PENDING"
 
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=f"{jobid}\n", stderr=""
-            )
-        elif cmd[0] == "scancel":
-            prefixes = cmd[2:]
-
-            for jobid in squeue:
-                if any(jobid.startswith(prefix) for prefix in prefixes):
-                    squeue[jobid] = "CANCELLED"
-
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="terminating job\n", stderr=""
-            )
-        elif cmd[0] == "sacct":
-            prefix = cmd[2]
-            lines = []
-
-            for jobid, status in squeue.items():
-                if jobid.startswith(prefix):
-                    lines.append(f"{jobid}|{status}")
-
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="\n".join(lines) + "\n", stderr=""
-            )
+            return FakeProcess(stdout=f"{jobid}\n")
         else:
             raise NotImplementedError(f"Unknown command {cmd[0]}")
 
-    with patch("subprocess.run", side_effect=run) as m:
+    class FakeProcess:
+        def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0) -> None:
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return self._stdout.encode(), self._stderr.encode()
+
+    with (
+        patch("subprocess.run", side_effect=run) as m,
+        patch("asyncio.create_subprocess_exec", new=exec),
+    ):
         yield m
 
 
@@ -215,12 +229,12 @@ def test_dependency_submission_failure() -> None:
     a_job = echo("a")
     b_job = echo("b").after(a_job)
 
-    def failing_sbatch(cmd: list[str], **ignore) -> subprocess.CompletedProcess[str]:
-        if cmd[0] == "sbatch":
-            raise subprocess.CalledProcessError(cmd=cmd, returncode=1, stderr="submission error")
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+    async def failing_exec(*cmd: str, **ignore) -> "FakeProcess":  # noqa: F821
+        raise subprocess.CalledProcessError(
+            cmd=list(cmd), returncode=1, output="", stderr="submission error"
+        )
 
-    with patch("subprocess.run", side_effect=failing_sbatch):
+    with patch("asyncio.create_subprocess_exec", new=failing_exec):
         scheduler = dawgz.schedule(b_job, backend="slurm")
 
     assert "JobSubmissionError" in scheduler.logs(a_job)
