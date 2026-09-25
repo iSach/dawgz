@@ -2,17 +2,14 @@ r"""Module's main"""
 
 import argparse
 import csv
-import rich.box
-import rich.console
-import rich.table
 import shutil
 
 from typing import Literal
 
-from dawgz import Scheduler, get_dawgz_dir
-
 
 def list_workflows() -> list[list[str]]:
+    from dawgz import get_dawgz_dir
+
     record = get_dawgz_dir() / "workflows.csv"
 
     if record.exists():
@@ -29,6 +26,12 @@ def report(
     entry: Literal["source", "settings", "input", "logs"] = "logs",
     raw: bool = False,
 ) -> None:
+    import rich.box
+    import rich.console
+    import rich.table
+
+    from dawgz import Scheduler, get_dawgz_dir
+
     workflows = list_workflows()
 
     if workflow is None:
@@ -73,6 +76,8 @@ def cancel(
     job: int | None = None,
     i: int | None = None,
 ) -> None:
+    from dawgz import Scheduler, get_dawgz_dir
+
     workflows = list_workflows()
 
     row = workflows[workflow]
