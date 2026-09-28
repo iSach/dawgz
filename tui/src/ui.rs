@@ -762,12 +762,16 @@ fn row_view(app: &App, w: &Workflow, row: &Row, now: f64) -> RowView {
                     .collect();
                 let jobid = match ids.first() {
                     Some(first) => {
-                        let bases: std::collections::HashSet<&str> = ids
+                        let mut bases: Vec<u64> = ids
                             .iter()
-                            .map(|i| i.split('_').next().unwrap_or(i))
+                            .filter_map(|i| i.split('_').next().and_then(|b| b.parse().ok()))
                             .collect();
+                        bases.sort();
+                        bases.dedup();
                         if bases.len() == 1 && ids.len() > 1 && first.contains('_') {
-                            format!("{}_[…]", first.split('_').next().unwrap_or(first))
+                            format!("{}_[…]", bases[0])
+                        } else if bases.len() > 1 && bases.len() < ids.len() {
+                            format!("{}…{}", bases[0], bases[bases.len() - 1])
                         } else if ids.len() > 1 {
                             format!("{first} +{}", ids.len() - 1)
                         } else {

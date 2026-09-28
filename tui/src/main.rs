@@ -544,8 +544,14 @@ mod tests {
     fn resolves_queue_owners() {
         let dir = fixture("owner");
         let app = App::new(theme::Theme::mocha(), vec![dir.clone()], false, 30.0, true);
-        assert_eq!(app.owner("101_3"), Some(("demo.py".into(), "task(4)".into())));
-        assert_eq!(app.owner("102_2"), Some(("demo.py".into(), "train[2]".into())));
+        assert_eq!(
+            app.owner("101_3"),
+            Some(("demo.py".into(), "task(4)".into()))
+        );
+        assert_eq!(
+            app.owner("102_2"),
+            Some(("demo.py".into(), "train[2]".into()))
+        );
         assert_eq!(app.owner("101_[5-9]").map(|o| o.1), Some("task ×5".into()));
         assert_eq!(app.owner("999"), None);
         let _ = fs::remove_dir_all(dir);

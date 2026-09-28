@@ -462,6 +462,9 @@ def jobid_range(jobids: list[str]) -> str:
         tasks = sorted(map(int, tasks))
         if tasks == list(range(tasks[0], tasks[-1] + 1)):
             return f"{bases.pop()}_[{tasks[0]}-{tasks[-1]}]"
+    elif all(bases) and all(b.isdigit() for b in bases):
+        bases = sorted(bases, key=int)
+        return f"{bases[0]}…{bases[-1]}"
 
     return f"{jobids[0]} +{len(jobids) - 1}"
 
