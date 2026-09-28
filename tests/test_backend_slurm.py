@@ -502,3 +502,50 @@ def test_recorded_before_submission(fake_slurm: Path, monkeypatch: pytest.Monkey
     thread.join()
 
     assert seen == [6]
+
+
+@pytest.mark.parametrize("snapshot", [False, True])
+def test_code_snapshot(
+    tmp_path: Path, fake_slurm: Path, wait_slurm: Callable, snapshot: bool
+) -> None:
+    import subprocess
+    import sys
+
+    project = tmp_path / "project"
+    (project / "mylib").mkdir(parents=True)
+    (project / "mylib" / "__init__.py").write_text("")
+    (project / "mylib" / "model.py").write_text("VERSION = 'old'\n")
+    (project / "helpers.py").write_text("NOTE = 'old'\n")
+    (project / "train.py").write_text(
+        "import dawgz\n"
+        "from mylib import model\n"
+        "@dawgz.job\n"
+        "def train():\n"
+        "    import helpers  # imported when the job runs\n"
+        "    print(model.VERSION, helpers.NOTE)\n"
+        f"dawgz.schedule(train(), backend='slurm', snapshot={snapshot}, quiet=True)\n"
+    )
+
+    env = {**os.environ, "DAWGZ_DIR": str(dawgz.get_dawgz_dir())}
+    subprocess.run([sys.executable, "train.py"], cwd=project, env=env, check=True)
+
+    # Keep editing the code while the job is pending (different sizes, such that cached
+    # bytecode written in the same second is invalidated)
+    (project / "mylib" / "model.py").write_text("VERSION = 'newer'\n")
+    (project / "helpers.py").write_text("NOTE = 'newer'\n")
+
+    # The job starts later
+    jobid = next((fake_slurm / "jobs").glob("*.json")).stem
+    fakeslurm = Path(__file__).resolve().parents[1] / "tools" / "fakeslurm" / "fakeslurm.py"
+    subprocess.run([sys.executable, str(fakeslurm), "_exec", jobid], cwd=project, check=True)
+
+    path = next(p for p in dawgz.get_dawgz_dir().iterdir() if p.is_dir())
+    logs = (path / "0000_train.log").read_text().strip()
+
+    assert logs == ("old old" if snapshot else "newer newer")
+
+    meta = store.read_json(path / "workflow.json")
+    assert ("snapshot" in meta) == snapshot
+    if snapshot:
+        assert meta["snapshot"]["files"] >= 3
+        assert not (path / "snapshot" / "dawgz").exists()

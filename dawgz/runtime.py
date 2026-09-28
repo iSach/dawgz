@@ -675,6 +675,10 @@ for path in reversed(__PATHS__):
     if path not in sys.path:
         sys.path.insert(1, path)
 
+# A snapshot of the local code, taken at submission, comes first
+if os.path.isdir(os.path.join(HERE, "snapshot")):
+    sys.path.insert(0, os.path.join(HERE, "snapshot"))
+
 try:
     from dawgz.runtime import main
 except ImportError:  # dawgz is not available in the job environment

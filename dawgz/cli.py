@@ -367,6 +367,8 @@ def render_workflow(index: int, workflow: Workflow, args: argparse.Namespace) ->
     meta = [workflow.backend, term.age(workflow.timestamp, now), f"{len(workflow.jobs)} jobs"]
     if total != len(workflow.jobs):
         meta[-1] += f" ({total} tasks)"
+    if workflow.meta.get("snapshot"):
+        meta.append(f"code snapshot of {workflow.meta['snapshot']['files']} files")
     if workflow.backend == "slurm" and workflow.updated:
         meta.append(f"slurm states from {term.age(workflow.updated, now)}")
 

@@ -2469,6 +2469,19 @@ fn draw_info(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         "command",
         vec![Span::styled(m.argv.join(" "), t.sub())],
     ));
+    if let Some(snap) = &m.snapshot {
+        lines.push(kv(
+            t,
+            "snapshot",
+            vec![Span::styled(
+                format!(
+                    "{} files of local code, frozen at submission",
+                    snap.get("files").and_then(|v| v.as_u64()).unwrap_or(0)
+                ),
+                Style::default().fg(t.green),
+            )],
+        ));
+    }
     lines.push(kv(
         t,
         "records",

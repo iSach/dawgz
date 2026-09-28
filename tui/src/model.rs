@@ -18,6 +18,7 @@ pub struct Meta {
     pub user: String,
     pub pid: Option<i64>,
     pub pid_start: Option<u64>,
+    pub snapshot: Option<serde_json::Value>,
     pub jobs: Vec<JobMeta>,
     pub sources: Vec<String>,
 }

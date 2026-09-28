@@ -54,6 +54,7 @@ class SlurmScheduler(Scheduler):
         concurrency: int | None = None,
         pack: bool | None = None,
         throttle: int | None = None,
+        snapshot: bool | None = None,
     ) -> None:
         r"""
         Arguments:
@@ -66,6 +67,10 @@ class SlurmScheduler(Scheduler):
             throttle: The maximum number of simultaneously running tasks of each pack
                 (and of job arrays without their own throttle). For example, with
                 `throttle=4`, a fan-out of 100 jobs runs 4 at a time.
+            snapshot: Whether to copy the local code imported by the script (modules
+                and packages that are not installed) at submission, such that jobs run
+                with this code even if it is edited before they start. If `None`, use
+                the `DAWGZ_SNAPSHOT` environment variable or `False`.
         """
 
         super().__init__(name=name)
@@ -82,7 +87,19 @@ class SlurmScheduler(Scheduler):
         self.concurrency = max(concurrency, 1)
         self.pack = pack
         self.throttle = throttle
+
+        if snapshot is None:
+            snapshot = os.environ.get("DAWGZ_SNAPSHOT", "0") not in ("0", "false", "no", "")
+
+        self.code_snapshot = snapshot
+        self.snapshot_info = None
         self.scripts: dict[str, str] = {}
+
+    def describe(self) -> dict:
+        meta = super().describe()
+        if getattr(self, "snapshot_info", None):
+            meta["snapshot"] = self.snapshot_info
+        return meta
 
     def extra(self, job: Job) -> dict:
         script = getattr(self, "scripts", {}).get(self.tag(job))
@@ -145,6 +162,12 @@ class SlurmScheduler(Scheduler):
 
     def run(self, jobs: list[Job]) -> None:
         (self.path / "run.py").write_text(runner(import_paths()))
+
+        if getattr(self, "code_snapshot", False):
+            from ..snapshot import take
+
+            paths = import_paths()
+            self.snapshot_info = take(self.path / "snapshot", paths[0] if paths else None)
 
         units = self.units(jobs) if self.pack else [[job] for job in jobs]
 

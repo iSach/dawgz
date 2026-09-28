@@ -14,6 +14,8 @@
     ├── <tag>.sh, <tag>.pkl        Slurm script and pickled job(s)
     ├── <tag>.pack.{sh,pkl,json}   packed jobs (one Slurm array for several jobs)
     ├── run.py                     entry point of Slurm jobs
+    ├── fn_<hash>.pkl              pickled job functions, stored once
+    ├── snapshot/                  copy of the local code (`snapshot=True`)
     └── dump.pkl                   pickled scheduler (`dawgz.Scheduler.load`)
 ```
 

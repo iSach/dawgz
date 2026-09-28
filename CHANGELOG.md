@@ -10,6 +10,7 @@
 * **New CLI** without third-party dependencies: dependency graph, grouped fan-outs with stacked progress bars, job details with progress and log tails, `logs -f`, `cancel`, `du`, `clean`, `--json`, `--watch`, references by index, name or ID.
 * **`dawgz-tui`**, an interactive terminal interface written in Rust (ratatui), with workflows, jobs, arrays, timeline, graph, logs, search, filters, cancellation and a Slurm queue view.
 * **Sequential local execution by default.** The new `local` backend runs each job in a fresh process, one at a time (`workers=1`) in the order listed by `dawgz`, or in parallel with `workers=N`.
+* **Code snapshots.** `snapshot=True` (or `DAWGZ_SNAPSHOT=1`) copies the local code imported by the script at submission, such that Slurm jobs run with it even if it is edited before they start.
 * **Friendlier interface**: `backend` defaults to `$DAWGZ_BACKEND` or `"local"`, options of other backends are ignored, `factory.map(...)`, `factory.options(...)`, `a >> b`, `throttle=` for Slurm packs.
 
 ### Bug fixes
