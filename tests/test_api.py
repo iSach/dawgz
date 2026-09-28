@@ -207,3 +207,47 @@ def test_spawn_start(tmp_path: Path) -> None:
     assert scheduler.logs(jobs[0]) == ""
     assert all(scheduler.state(j) == "COMPLETED" for j in jobs)
     assert not list(scheduler.path.glob("*.local.pkl"))
+
+
+BIG = list(range(3_000_000))  # ~15 MB once pickled
+
+
+@dawgz.job
+def uses_big(i: int) -> None:
+    print(i, len(BIG))
+
+
+def test_large_globals_are_stored_once(
+    fake_slurm: Path, slurm_exec: None, wait_slurm: object
+) -> None:
+    from dawgz import payload
+
+    payload.WARNED.clear()
+
+    with pytest.warns(payload.LargeJobWarning, match="'BIG'"):
+        jobs = uses_big.map(range(20))
+
+    scheduler = dawgz.schedule(*jobs, backend="slurm", quiet=True)
+    sizes = {p.name: p.stat().st_size for p in scheduler.path.glob("*.pkl")}
+    functions = [n for n in sizes if n.startswith("fn_")]
+
+    assert len(functions) == 1
+    assert sizes[functions[0]] > 10 * 2**20
+    assert sum(s for n, s in sizes.items() if n.startswith("0")) < 2**20  # payloads are tiny
+
+    wait_slurm()
+    assert scheduler.logs(jobs[7]) == "7 3000000"
+
+
+def test_map_pickles_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dawgz import payload
+
+    calls = []
+    intern = payload.intern
+    monkeypatch.setattr(payload, "intern", lambda fun: calls.append(fun) or intern(fun))
+
+    append.map(["x"] * 10, range(10))
+    assert len(calls) == 1
+
+    [append("x", i) for i in range(3)]
+    assert len(calls) == 4

@@ -52,6 +52,9 @@ class JobFactory(Generic[P]):
         self._source: str | None = None
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> Job:
+        return self._job(args, kwargs)
+
+    def _job(self, args: tuple, kwargs: dict, fun_key: str | None = None) -> Job:
         if self._source is None:
             self._source = get_source(self.fun)
 
@@ -65,6 +68,7 @@ class JobFactory(Generic[P]):
             env=self.env,
             settings=self.settings,
             source=self._source,
+            fun_key=fun_key,
         )
 
     def __get__(self, obj: object, objtype: type | None = None) -> Any:
@@ -132,7 +136,11 @@ class JobFactory(Generic[P]):
             >>> merge().after(*tasks)
         """
 
-        jobs = [self(*args) for args in zip(*iterables, strict=True)]
+        from . import payload
+
+        # Nothing can change between these jobs: the function is pickled once
+        key = payload.intern(self.fun)
+        jobs = [self._job(args, {}, key) for args in zip(*iterables, strict=True)]
 
         if array or throttle is not None:
             return JobArray(*jobs, name=name, throttle=throttle)

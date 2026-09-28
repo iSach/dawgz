@@ -293,7 +293,8 @@ def test_job_array(slurm_exec: None, wait_slurm: Callable) -> None:
 
     # A single pickle for the whole array
     assert (scheduler.path / f"{scheduler.tag(array)}.pkl").exists()
-    assert len([p for p in scheduler.path.glob("*.pkl") if p.name != "dump.pkl"]) == 1
+    assert len(list(scheduler.path.glob("0*.pkl"))) == 1
+    assert len(list(scheduler.path.glob("fn_*.pkl"))) == 1  # the function, stored once
 
     wait_slurm()
 

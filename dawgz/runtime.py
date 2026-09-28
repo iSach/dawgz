@@ -442,10 +442,11 @@ def execute(
     out_fd: int | None = None,
     tee: bool = False,
     capture_streams: bool = True,
+    path: str | Path | None = None,
 ) -> int:
     r"""Runs a pickled callable, reporting its status. Returns the exit code."""
 
-    import pickle
+    from .payload import resolve
 
     global CURRENT
     CURRENT = run
@@ -467,7 +468,7 @@ def execute(
 
     with context:
         try:
-            pickle.loads(data)()
+            resolve(data, path)()
         except SystemExit as e:
             if e.code is None or isinstance(e.code, int):
                 code = e.code or 0
@@ -543,7 +544,7 @@ def main(path: str, *argv: str) -> None:
             run.finish("FAILED", f"{type(e).__name__}: {e}")
         sys.exit(1)
 
-    sys.exit(execute(data, run, out_fd=out_fd))
+    sys.exit(execute(data, run, out_fd=out_fd, path=path))
 
 
 def runner(paths: list[str]) -> str:
@@ -596,5 +597,15 @@ else:
         os.dup2(fd, 1)
         os.dup2(fd, 2)
 
-    pickle.loads(data)()
+    obj = pickle.loads(data)
+
+    if isinstance(obj, tuple) and obj[:1] in (("dawgz-call-v1",), ("dawgz-ref-v1",)):
+        kind, fun, args = obj
+        if kind == "dawgz-ref-v1":
+            with open(os.path.join(HERE, "fn_" + fun + ".pkl"), "rb") as f:
+                fun = f.read()
+        args, kwargs = pickle.loads(args)
+        pickle.loads(fun)(*args, **kwargs)
+    else:
+        obj()
 """

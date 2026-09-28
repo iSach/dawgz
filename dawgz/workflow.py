@@ -6,7 +6,6 @@ import inspect
 import itertools
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from functools import partial
 from pathlib import Path
 from textwrap import dedent, indent
 from typing import (
@@ -58,18 +57,21 @@ class Job(Node):
         env: list[str] | None = None,
         settings: dict[str, int | float | bool | str] | None = None,
         source: str | None = None,
+        fun_key: str | None = None,
     ) -> None:
         super().__init__()
 
         self.seq = next(COUNTER)
 
+        # The function is pickled (with the globals it uses) once per distinct content
         if fun is None:
-            self.pkl = None
+            self.fun_key, self.args_pkl = None, None
         else:
-            import cloudpickle
+            from . import payload
 
             inspect.signature(fun).bind(*args, **kwargs)
-            self.pkl = cloudpickle.dumps(partial(fun, *args, **kwargs))
+            self.fun_key = payload.intern(fun) if fun_key is None else fun_key
+            self.args_pkl = payload.arguments(args, kwargs)
 
         # Name
         if name is None:
@@ -123,9 +125,21 @@ class Job(Node):
     def __str__(self) -> str:
         return self.name
 
+    @property
+    def pkl(self) -> bytes | None:
+        r"""The self-contained pickled payload of the job."""
+
+        if getattr(self, "fun_key", None) is None:
+            return None
+
+        from . import payload
+
+        return payload.inline(self.fun_key, self.args_pkl)
+
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         state.pop("pkl", None)
+        state.pop("args_pkl", None)
         return state
 
     def __setstate__(self, state: dict) -> None:

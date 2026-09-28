@@ -14,7 +14,7 @@ from .core import (
     JobSubmissionError,
     Scheduler,
 )
-from .. import sacct, store
+from .. import payload, sacct, store
 from ..runtime import runner
 from ..utils import bytes_dump, trace
 from ..workflow import Job, JobArray
@@ -287,16 +287,20 @@ class SlurmScheduler(Scheduler):
 
     def _write_files(self, unit: list[Job], name: str, shfile: Path, script: str) -> None:
         job = unit[0]
+        jobs = list(job.array) if isinstance(job, JobArray) else unit
+
+        # Each distinct function is written once per workflow
+        payload.write_functions(self.path, {j.fun_key for j in jobs})
+        payloads = [payload.reference(j.fun_key, j.args_pkl) for j in jobs]
 
         if len(unit) > 1:
-            with open(self.path / f"{name}.pkl", "wb") as f:
-                bytes_dump(f, [j.pkl for j in unit])
             store.write_json(self.path / f"{name}.json", [self.tag(j) for j in unit])
-        elif isinstance(job, JobArray):
+
+        if len(payloads) > 1 or isinstance(job, JobArray):
             with open(self.path / f"{name}.pkl", "wb") as f:
-                bytes_dump(f, [job[i].pkl for i in range(len(job))])
+                bytes_dump(f, payloads)
         else:
-            (self.path / f"{name}.pkl").write_bytes(job.pkl)
+            (self.path / f"{name}.pkl").write_bytes(payloads[0])
 
         shfile.write_text(script)
 
