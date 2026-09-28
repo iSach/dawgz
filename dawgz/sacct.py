@@ -42,7 +42,9 @@ def query(jobids: list[str]) -> dict[str, dict]:
     """
 
     entries = {}
-    jobids = list(dict.fromkeys(jobids))
+
+    # Array tasks (e.g. packed jobs "123_4") are fetched with their array ("123")
+    jobids = list(dict.fromkeys(jobid.split("_")[0] for jobid in jobids))
 
     for k in range(0, len(jobids), CHUNK):
         entries.update(_query(jobids[k : k + CHUNK]))
@@ -181,7 +183,9 @@ def refresh(records: list, ttl: float = TTL, force: bool = False) -> int:
     if not stale:
         return 0
 
-    jobids = [job["jobid"] for jobs in stale.values() for job in jobs]
+    jobids = list(
+        dict.fromkeys(job["jobid"].split("_")[0] for jobs in stale.values() for job in jobs)
+    )
     now = time.time()
     entries = query(jobids)
 

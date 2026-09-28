@@ -2,6 +2,7 @@ r"""Local scheduling backends"""
 
 from __future__ import annotations
 
+import heapq
 import os
 import pickle
 import random
@@ -9,7 +10,6 @@ import signal
 import sys
 import time
 
-from collections import deque
 from functools import partial
 
 from .core import Scheduler, readiness
@@ -33,6 +33,7 @@ class LocalScheduler(Scheduler):
         name: str,
         workers: int | None = 1,
         max_workers: int | None = None,
+        start: str | None = None,
     ) -> None:
         r"""
         Arguments:
@@ -40,6 +41,10 @@ class LocalScheduler(Scheduler):
             workers: The maximum number of jobs (or array elements) running in parallel.
                 If `None`, use all CPU cores.
             max_workers: Deprecated alias for `workers`.
+            start: How job processes are started. With `"fork"` (default on Linux), jobs
+                inherit the modules already imported by the script, which makes them
+                start instantly. With `"spawn"` (default on macOS), each job runs in a
+                fresh interpreter, which is safer if the script uses threads.
         """
 
         super().__init__(name=name)
@@ -47,6 +52,13 @@ class LocalScheduler(Scheduler):
         if max_workers is not None:
             workers = max_workers
 
+        if start is None:
+            start = os.environ.get("DAWGZ_START") or ("fork" if _can_fork() else "spawn")
+
+        if start not in ("fork", "spawn"):
+            raise ValueError(f"start should be 'fork' or 'spawn', got {start!r}")
+
+        self.start = start
         self.workers = workers or os.cpu_count() or 1
         self.max_workers = self.workers  # backward compatibility
         self.entries: dict[int, dict] = {}
@@ -83,7 +95,8 @@ class LocalScheduler(Scheduler):
 
         outcomes: dict[Job, str] = {}
         waiting = list(jobs)
-        queue: deque[tuple[Job, int | None]] = deque()
+        # Ready jobs run by increasing index, i.e. in the order listed by `dawgz`
+        queue: list[tuple[int, int, Job]] = []
         running: dict[int, tuple[Job, int | None]] = {}
         remaining: dict[Job, int] = {}
         failures: dict[Job, int] = {}
@@ -109,19 +122,23 @@ class LocalScheduler(Scheduler):
                             changed = True
                         elif status == "ready":
                             waiting.remove(job)
-                            started += 1
-                            self._announce(job, started, len(jobs))
+                            k = self.order[job]
                             if isinstance(job, JobArray):
-                                queue.extend((job, j) for j in range(len(job)))
+                                for j in range(len(job)):
+                                    heapq.heappush(queue, (k, j, job))
                                 remaining[job] = len(job)
                             else:
-                                queue.append((job, None))
+                                heapq.heappush(queue, (k, -1, job))
                                 remaining[job] = 1
                             failures[job] = 0
 
                 # Launch
                 while queue and len(running) < self.workers:
-                    job, i = queue.popleft()
+                    _, j, job = heapq.heappop(queue)
+                    i = None if j < 0 else j
+                    if j <= 0:  # first (or only) element
+                        started += 1
+                        self._announce(job, started, len(jobs))
                     pid = self._spawn(job, i)
                     running[pid] = (job, i)
                     self._set(job, i, state="RUNNING", start=time.time())
@@ -186,8 +203,8 @@ class LocalScheduler(Scheduler):
         for stream in (sys.stdout, sys.stderr):
             stream.flush()
 
-        if not _can_fork():  # pragma: no cover
-            return self._spawn_process(data, logfile, runfile)
+        if getattr(self, "start", "fork") == "spawn":
+            return self._spawn_process(data, logfile, runfile, tty)
 
         pid = os.fork()
 
@@ -202,13 +219,23 @@ class LocalScheduler(Scheduler):
 
         return pid
 
-    def _spawn_process(
-        self, data: bytes, logfile: object, runfile: object
-    ) -> int:  # pragma: no cover
-        import multiprocessing as mp
+    def _spawn_process(self, data: bytes, logfile: object, runfile: object, tty: bool) -> int:
+        import subprocess
 
-        process = mp.get_context("spawn").Process(target=_child, args=(data, logfile, runfile))
-        process.start()
+        pklfile = str(runfile).replace(".run.json", ".local.pkl")
+        with open(pklfile, "wb") as f:
+            f.write(data)
+
+        code = "import sys; from dawgz.schedulers.local import _spawned; _spawned(*sys.argv[1:])"
+        env = {**os.environ, "DAWGZ_TTY": "1" if tty else "0"}
+        paths = [p for p in sys.path if p]
+        env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(paths))
+
+        # The process is reaped with `os.waitpid`, like forked ones
+        process = subprocess.Popen(
+            [sys.executable, "-c", code, pklfile, str(logfile), str(runfile)],
+            env=env,
+        )
         return process.pid
 
     def _set(self, job: Job, i: int | None, **fields) -> None:
@@ -265,7 +292,7 @@ class LocalScheduler(Scheduler):
             size = f" · {len(job)} tasks" if isinstance(job, JobArray) else ""
             _eprint(term.style(f"▶ [{k}/{n}] {job!r}{size}", "cyan"))
 
-    def _interrupt(self, running: dict, queue: deque, waiting: list) -> None:
+    def _interrupt(self, running: dict, queue: list, waiting: list) -> None:
         for pid in running:
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -298,10 +325,7 @@ class LocalScheduler(Scheduler):
 
 
 class AsyncScheduler(LocalScheduler):
-    r"""Alias of the local scheduler, kept for backward compatibility.
-
-    Unlike `LocalScheduler`, all independent jobs run in parallel by default.
-    """
+    r"""Alias of the local scheduler, kept for backward compatibility (`max_workers`)."""
 
     backend: str = "async"
 
@@ -341,10 +365,19 @@ def _child(data: bytes, logfile: object, runfile: object) -> int:
     if os.environ.get("DAWGZ_RAW_LOGS", "") not in ("", "0"):
         os.dup2(fd, 1)
         os.dup2(fd, 2)
+        sys.stdout = open(1, "w", buffering=1, closefd=False)  # noqa: SIM115
+        sys.stderr = open(2, "w", buffering=1, closefd=False)  # noqa: SIM115
 
     run = Run(runfile)
 
     return execute(data, run, out_fd=fd, tee=True)
+
+
+def _spawned(pklfile: str, logfile: str, runfile: str) -> None:
+    with open(pklfile, "rb") as f:
+        data = f.read()
+    os.remove(pklfile)
+    sys.exit(_child(data, logfile, runfile))
 
 
 class Terminated(Exception):

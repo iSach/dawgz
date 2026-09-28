@@ -342,6 +342,9 @@ impl Workflow {
         if let Some(run) = run {
             let rs = run.state();
             if !terminal && (is_terminal(rs) || rs == "RUNNING") {
+                // Cached times are older than the job's own report
+                merged.elapsed = None;
+                merged.reason = None;
                 merged.state = run.state.clone();
                 merged.start = run.start.or(merged.start);
                 if run.end.is_some() {

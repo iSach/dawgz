@@ -129,7 +129,7 @@ def counts_text(counts: dict[str, int], total: int | None = None) -> str:
 
 
 def elapsed(entry: dict, now: float) -> float | None:
-    if entry.get("elapsed") is not None and store.is_terminal(entry.get("state")):
+    if entry.get("elapsed") and store.is_terminal(entry.get("state")):
         return entry["elapsed"]
 
     start = entry.get("start")
@@ -156,7 +156,7 @@ def bar_text(bar: dict) -> str:
             if rate >= 1
             else f"{1 / rate:.3g} s/{bar.get('unit') or 'it'}"
         )
-    if bar.get("eta") is not None and total:
+    if bar.get("eta") is not None and total and n < total:
         parts.append(f"eta {term.duration(bar['eta'])}")
 
     return " · ".join(parts)
@@ -411,8 +411,7 @@ def render_workflow(index: int, workflow: Workflow, args: argparse.Namespace) ->
 
         entries = summary["elements"]
         times = [t for t in (elapsed(e, now) for e in entries) if t is not None]
-        jobids = sorted({j.get("jobid") for j in group if j.get("jobid")})
-        jobid = jobids[0] + (f" +{len(jobids) - 1}" if len(jobids) > 1 else "") if jobids else ""
+        jobid = jobid_range([j.get("jobid") for j in group if j.get("jobid")])
 
         table.append([
             term.style(ids, "gray"),
@@ -424,10 +423,15 @@ def render_workflow(index: int, workflow: Workflow, args: argparse.Namespace) ->
             term.style(jobid, "gray"),
         ])
 
+    if not any(j.get("jobid") for j in workflow.jobs):
+        table = [row[:-1] for row in table]
+
     lines.extend(
         term.table(
             table,
-            header=["#", "", "JOB", "STATE", "PROGRESS", "TIME", "JOBID"],
+            header=["#", "", "JOB", "STATE", "PROGRESS", "TIME", "JOBID"][
+                : len(table[0]) if table else 7
+            ],
             align=">",
             flex=4,
             max_width=width,
@@ -441,6 +445,25 @@ def render_workflow(index: int, workflow: Workflow, args: argparse.Namespace) ->
     lines.append(term.style("details: " + " · ".join(hints), "gray"))
 
     return lines
+
+
+def jobid_range(jobids: list[str]) -> str:
+    r"""Summarizes job IDs, e.g. `["12_0", "12_1", "12_2"]` as `12_[0-2]`."""
+
+    if not jobids:
+        return ""
+    elif len(jobids) == 1:
+        return jobids[0]
+
+    bases = {jobid.partition("_")[0] for jobid in jobids}
+    tasks = [jobid.partition("_")[2] for jobid in jobids]
+
+    if len(bases) == 1 and all(t.isdigit() for t in tasks):
+        tasks = sorted(map(int, tasks))
+        if tasks == list(range(tasks[0], tasks[-1] + 1)):
+            return f"{bases.pop()}_[{tasks[0]}-{tasks[-1]}]"
+
+    return f"{jobids[0]} +{len(jobids) - 1}"
 
 
 def merge_summaries(summaries: list[dict]) -> dict:

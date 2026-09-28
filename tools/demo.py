@@ -10,6 +10,7 @@ The script prints the environment to use for `dawgz` and `dawgz-tui` afterwards.
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,7 +21,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 FAKESLURM = REPO / "tools" / "fakeslurm"
 
-SWEEP = '''
+SWEEP = """
 import random
 import time
 
@@ -44,9 +45,9 @@ def select() -> None:
 if __name__ == "__main__":
     fits = [fit(lr, seed) for lr in (1e-2, 1e-3, 1e-4) for seed in range(20)]
     dawgz.schedule(select().after(*fits), name="sweep.py")
-'''
+"""
 
-TIMEOUT = '''
+TIMEOUT = """
 import time
 
 import dawgz
@@ -66,9 +67,9 @@ def cleanup() -> None:
 if __name__ == "__main__":
     job = slow()
     dawgz.schedule(cleanup().after(job, status="any"), job, name="timeout.py")
-'''
+"""
 
-LOCAL = '''
+LOCAL = """
 import time
 
 import dawgz
@@ -96,11 +97,13 @@ if __name__ == "__main__":
     dl = download()
     shards = [s.after(dl) for s in shards]
     dawgz.schedule(stats().after(*shards), name="prepare.py", backend="local", workers=3, quiet=True)
-'''
+"""
 
 
 def main() -> None:
-    root = Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="dawgz-demo-")).resolve()
+    root = Path(
+        sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="dawgz-demo-")
+    ).resolve()
     root.mkdir(parents=True, exist_ok=True)
     (root / "slurm").mkdir(exist_ok=True)
 
@@ -116,6 +119,10 @@ def main() -> None:
         "DAWGZ_NO_GLOBAL_REGISTRY": "1",
     }
 
+    # Never reach a real cluster
+    for command in ("sbatch", "sacct", "scancel", "srun"):
+        assert shutil.which(command, path=env["PATH"]) == str(FAKESLURM / command)
+
     for name, code in (("prepare.py", LOCAL), ("sweep.py", SWEEP), ("timeout.py", TIMEOUT)):
         (root / name).write_text(textwrap.dedent(code))
 
@@ -124,14 +131,18 @@ def main() -> None:
     for script in ("prepare.py", "timeout.py", "sweep.py", "showcase.py"):
         subprocess.run([sys.executable, script], cwd=root, env=env, check=True)
 
-    exports = " ".join(
-        f"{k}={shlex.quote(env[k])}" for k in ("PATH", "FAKESLURM_DIR", "FAKESLURM_EXEC", "DAWGZ_DIR")
-    )
+    # Environment to explore the demo (the fake Slurm comes first in PATH)
+    tui = REPO / "tui" / "target" / "release"
+    lines = [f"export PATH={shlex.quote(f'{FAKESLURM}:{python}:{tui}')}:$PATH"]
+    for k in ("FAKESLURM_DIR", "FAKESLURM_EXEC", "DAWGZ_DIR"):
+        lines.append(f"export {k}={shlex.quote(env[k])}")
+    (root / "env.sh").write_text("\n".join(lines) + "\n")
 
     print(f"\nDemo workflows are running on a fake Slurm in {root}")
     print("Explore them with:\n")
-    print(f"  env {exports} dawgz")
-    print(f"  env {exports} dawgz-tui")
+    print(f"  source {root / 'env.sh'}")
+    print("  dawgz")
+    print("  dawgz tui")
 
 
 if __name__ == "__main__":

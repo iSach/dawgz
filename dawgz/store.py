@@ -337,7 +337,10 @@ class Workflow:
         if run is None or state in TERMINAL:
             merged = dict(cached)
         elif run.get("state") in TERMINAL or run.get("state") == "RUNNING":
-            merged = {**cached, **{k: v for k, v in run.items() if k != "progress"}}
+            # Cached times are older than the job's own report
+            stale = ("progress", "elapsed", "reason")
+            merged = {**{k: v for k, v in cached.items() if k not in stale}}
+            merged.update({k: v for k, v in run.items() if k != "progress"})
         else:
             merged = dict(cached)
 

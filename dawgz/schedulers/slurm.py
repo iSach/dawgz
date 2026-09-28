@@ -49,7 +49,11 @@ class SlurmScheduler(Scheduler):
     }
 
     def __init__(
-        self, name: str, concurrency: int | None = None, pack: bool | None = None
+        self,
+        name: str,
+        concurrency: int | None = None,
+        pack: bool | None = None,
+        throttle: int | None = None,
     ) -> None:
         r"""
         Arguments:
@@ -59,6 +63,9 @@ class SlurmScheduler(Scheduler):
             pack: Whether to submit independent jobs with identical settings and
                 dependencies as a single job array (one task per job). If `None`, use
                 the `DAWGZ_PACK` environment variable or `True`.
+            throttle: The maximum number of simultaneously running tasks of each pack
+                (and of job arrays without their own throttle). For example, with
+                `throttle=4`, a fan-out of 100 jobs runs 4 at a time.
         """
 
         super().__init__(name=name)
@@ -69,8 +76,12 @@ class SlurmScheduler(Scheduler):
         if pack is None:
             pack = os.environ.get("DAWGZ_PACK", "1") not in ("0", "false", "no")
 
+        if throttle is not None and (not isinstance(throttle, int) or throttle < 1):
+            raise ValueError(f"throttle should be a positive integer, got {throttle!r}")
+
         self.concurrency = max(concurrency, 1)
         self.pack = pack
+        self.throttle = throttle
         self.scripts: dict[str, str] = {}
 
     def extra(self, job: Job) -> dict:
@@ -345,13 +356,14 @@ class SlurmScheduler(Scheduler):
             f"#SBATCH --job-name={tag}" + (f"+{len(unit) - 1}" if len(unit) > 1 else ""),
         ]
 
+        throttle = getattr(self, "throttle", None)
+
         if len(unit) > 1:
-            lines.append(f"#SBATCH --array=0-{len(unit) - 1}")
+            limit = f"%{throttle}" if throttle else ""
+            lines.append(f"#SBATCH --array=0-{len(unit) - 1}{limit}")
         elif isinstance(job, JobArray):
-            if job.throttle is None:
-                lines.append(f"#SBATCH --array=0-{len(job) - 1}")
-            else:
-                lines.append(f"#SBATCH --array=0-{len(job) - 1}%{job.throttle}")
+            limit = job.throttle or throttle
+            lines.append(f"#SBATCH --array=0-{len(job) - 1}" + (f"%{limit}" if limit else ""))
 
         lines.append(f"#SBATCH --output={logfile}")
         lines.append("#")

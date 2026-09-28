@@ -978,7 +978,7 @@ fn bar_text(bar: &crate::model::Bar) -> String {
             format!("{} s/{unit}", sig3(1.0 / rate))
         });
     }
-    if let (Some(eta), Some(_)) = (bar.eta, bar.total) {
+    if let Some(eta) = bar.total.filter(|t| bar.n < *t).and(bar.eta) {
         parts.push(format!("eta {}", duration(eta)));
     }
     parts.join(" · ")
