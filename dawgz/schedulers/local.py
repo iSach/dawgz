@@ -164,13 +164,18 @@ class LocalScheduler(Scheduler):
                 code = os.waitstatus_to_exitcode(status)
                 run = store.read_json(store.run_file(self.path, self.tag(job), i)) or {}
 
+                error = None
+                if code != 0:
+                    error = run.get("error") or describe_exit(code)
+                    run.setdefault("error", error)
+
                 self._set(
                     job,
                     i,
                     state="COMPLETED" if code == 0 else "FAILED",
                     end=time.time(),
                     exit=f"{code}:0" if code >= 0 else f"0:{-code}",
-                    error=run.get("error") if code else None,
+                    error=error,
                 )
 
                 remaining[job] -= 1
@@ -378,6 +383,16 @@ def _spawned(pklfile: str, logfile: str, runfile: str) -> None:
         data = f.read()
     os.remove(pklfile)
     sys.exit(_child(data, logfile, runfile))
+
+
+def describe_exit(code: int) -> str:
+    if code < 0:
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = f"signal {-code}"
+        return f"killed by {name}"
+    return f"exited with code {code}"
 
 
 class Terminated(Exception):
