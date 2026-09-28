@@ -285,7 +285,18 @@ def execute(jobid: str) -> None:
                 jobid, task, state="RUNNING", start=time.time(), node="fake-node1", reason=""
             )
 
+        limit_s = parse_time(job.get("time"))
         for task, proc in list(running.items()):
+            start = load(jobid)["tasks"][task].get("start") or time.time()
+            if limit_s and proc.poll() is None and time.time() - start > limit_s:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+                del running[task]
+                update_task(jobid, task, state="TIMEOUT", end=time.time(), exit="0:15")
+                continue
             code = proc.poll()
             if code is not None:
                 del running[task]
@@ -297,6 +308,22 @@ def execute(jobid: str) -> None:
                     )
 
         time.sleep(0.05)
+
+
+def parse_time(text: str | None) -> float | None:
+    r"""Parses Slurm time limits (`MM`, `MM:SS`, `HH:MM:SS`, `D-HH:MM:SS`)."""
+
+    if not text or text == "UNLIMITED":
+        return None
+    days, _, rest = text.rpartition("-")
+    parts = [float(p) for p in rest.split(":")]
+    if len(parts) == 1:
+        seconds = 60 * parts[0]
+    elif len(parts) == 2:
+        seconds = 60 * parts[0] + parts[1]
+    else:
+        seconds = 3600 * parts[0] + 60 * parts[1] + parts[2]
+    return seconds + 86400 * (int(days) if days else 0)
 
 
 # sacct
