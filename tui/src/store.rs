@@ -633,9 +633,14 @@ impl Workflow {
     }
 
     pub fn log_path(&self, job: &JobMeta, i: Option<usize>) -> PathBuf {
-        match i {
+        let path = match i {
             Some(i) => self.path.join(format!("{}_{}.log", job.tag, i)),
             None => self.path.join(format!("{}.log", job.tag)),
+        };
+        // Packed jobs that failed before the dawgz runtime started
+        match &job.stdout {
+            Some(out) if !path.exists() && self.path.join(out).exists() => self.path.join(out),
+            _ => path,
         }
     }
 

@@ -693,7 +693,14 @@ def render_elements(workflow: Workflow, job: dict, args: argparse.Namespace) -> 
 def log_path(workflow: Workflow, job: dict, i: int | None) -> Path | None:
     if job.get("array") and i is None:
         return None
-    return store.log_file(workflow.path, job["tag"], i)
+
+    path = store.log_file(workflow.path, job["tag"], i)
+
+    # Packed jobs that failed before the dawgz runtime started (e.g. `module load` errors)
+    if not path.exists() and job.get("stdout") and (workflow.path / job["stdout"]).exists():
+        return workflow.path / job["stdout"]
+
+    return path
 
 
 def entry_text(
@@ -741,7 +748,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
     if job.get("array") and i is None:
         raise CLIError(f"job #{job['index']} is an array, specify an element")
 
-    logfile = store.log_file(workflow.path, job["tag"], i)
+    logfile = log_path(workflow, job, i)
 
     try:
         if args.follow:

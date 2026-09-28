@@ -420,3 +420,22 @@ def test_sacct_expand() -> None:
     assert sacct.expand("0-3") == [0, 1, 2, 3]
     assert sacct.expand("0-9:3%2") == [0, 3, 6, 9]
     assert sacct.expand("1,4-5") == [1, 4, 5]
+
+
+def test_pack_early_failure_logs(slurm_exec: None, wait_slurm: Callable) -> None:
+    # The job environment fails before the dawgz runtime starts
+    jobs = [
+        dawgz.job(lambda: None, name="x", env=["echo 'module: not found' >&2", "exit 3"])()
+        for _ in range(2)
+    ]
+    scheduler = dawgz.schedule(*jobs, backend="slurm", quiet=True)
+
+    wait_slurm()
+
+    from dawgz.cli import log_path
+
+    # No run file: the state comes from Slurm
+    view = store.Workflow.open(scheduler.path)
+    assert sacct.refresh([view], force=True) == 1
+    assert view.summary(view.jobs[1])["state"] == "FAILED"
+    assert "module: not found" in log_path(view, view.jobs[1], None).read_text()
