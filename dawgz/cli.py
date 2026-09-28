@@ -309,7 +309,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     lines = term.table(
         table,
         header=["#", "WORKFLOW", "ID", "CREATED", "BACKEND", "PROGRESS", "JOBS"],
-        align=">>" + "<" * 4 + ">",
+        align=">" + "<" * 5 + ">",
         flex=2,
         max_width=width,
     )
@@ -835,7 +835,7 @@ def cmd_du(args: argparse.Namespace) -> int:
             for k, row, usage in table[: None if args.all else 20]
         ],
         header=["#", "WORKFLOW", "ID", "TOTAL", "LOGS", "PICKLES", "FILES"],
-        align=">>" + "<" + ">>>>",
+        align=">" + "<<" + ">>>>",
         flex=2,
         max_width=term.terminal_width(),
     )

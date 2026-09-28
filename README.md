@@ -89,10 +89,10 @@ The `dawgz` command lists workflows, shows the jobs of a workflow with a depende
 
 ```
 $ dawgz
-#     WORKFLOW  ID                        CREATED  BACKEND  PROGRESS                        JOBS
-0   prepare.py  crimson_narwhal_64d7bcfa  13s ago  local    ━━━━━━━━━━━━━━━━━━━━ ✔8            8
-1   timeout.py  nimble_thistle_f92f542b   12s ago  slurm    ━━━━━━━━━━━━━━━━━━━━ ✔1 ✘1         2
-2     sweep.py  hardy_mango_6ff7cb7b      12s ago  slurm    ━━━━╸─────────────── ✔9 ●8 ◌44    61
+#  WORKFLOW     ID                        CREATED  BACKEND  PROGRESS                        JOBS
+0  prepare.py   crimson_narwhal_64d7bcfa  13s ago  local    ━━━━━━━━━━━━━━━━━━━━ ✔8            8
+1  timeout.py   nimble_thistle_f92f542b   12s ago  slurm    ━━━━━━━━━━━━━━━━━━━━ ✔1 ✘1         2
+2  sweep.py     hardy_mango_6ff7cb7b      12s ago  slurm    ━━━━╸─────────────── ✔9 ●8 ◌44    61
 3  showcase.py  cobalt_moose_fc44171d     12s ago  slurm    ━╸────────────────── ✔5 ●4 ◌42    44
 slurm states from 0s ago
 $ dawgz 3
