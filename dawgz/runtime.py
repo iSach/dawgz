@@ -258,6 +258,7 @@ class Cooker:
         self.shown = 0  # length of the last snapshot of a multi-row screen
         self.last = 0.0
         self.closed = False
+        self.lock = threading.Lock()
 
     def _write(self, data: str | bytes, fd: int | None = None) -> None:
         fd = self.out_fd if fd is None else fd
@@ -274,6 +275,15 @@ class Cooker:
             view = view[n:]
 
     def feed(self, data: bytes) -> None:
+        with self.lock:
+            if self.closed:  # output of processes outliving the job
+                self._write(data)
+                if self.tee_fd is not None:
+                    self._write(data, self.tee_fd)
+            else:
+                self._feed(data)
+
+    def _feed(self, data: bytes) -> None:
         if self.tee_fd is not None:
             self._write(data, self.tee_fd)
 
@@ -338,7 +348,7 @@ class Cooker:
                 if row.dirty:
                     self._progress(row, 0)
                     if time.monotonic() - self.last >= self.interval:
-                        self.checkpoint()
+                        self._checkpoint()
             elif len(row.buf) > row.written:
                 # Plain output is written through
                 self._write(row.buf[row.written :])
@@ -354,11 +364,16 @@ class Cooker:
                     self._progress(row, k)
                     dirty = True
             if dirty and time.monotonic() - self.last >= self.interval:
-                self.checkpoint()
+                self._checkpoint()
 
     def checkpoint(self) -> None:
         r"""Writes the current state of redrawn rows, to be overwritten later."""
 
+        with self.lock:
+            if not self.closed:
+                self._checkpoint()
+
+    def _checkpoint(self) -> None:
         rows = [row for row in self.rows if row.buf.strip()]
         if not rows or not any(row.dirty for row in self.rows):
             return
@@ -397,8 +412,13 @@ class Cooker:
             pass
 
     def close(self) -> None:
-        if self.closed:
-            return
+        r"""Writes all pending output. Later input is written as is."""
+
+        with self.lock:
+            if not self.closed:
+                self._close()
+
+    def _close(self) -> None:
         self.closed = True
 
         tail = self.decoder.decode(b"", final=True)
@@ -516,9 +536,12 @@ def capture(
         os.close(saved[0])
         os.close(saved[1])
 
-        # Processes that outlive the job may keep the pipe open: their output keeps
-        # going to the log, from a daemon thread
+        # Processes that outlive the job (e.g. daemons, the resource tracker of
+        # multiprocessing) may keep the pipe open: write the pending output now, and
+        # let their output go to the log, from a daemon thread
         thread.join(timeout=1.0)
+        if thread.is_alive():
+            cooker.close()
 
 
 # Entry points

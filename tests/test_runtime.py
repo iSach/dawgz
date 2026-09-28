@@ -303,3 +303,18 @@ def test_exit_code_out_of_range() -> None:
     job = dawgz.job(lambda: sys.exit(256), name="big_exit")()
     scheduler = dawgz.schedule(job, backend="local", quiet=True)
     assert scheduler.state(job) == "FAILED"
+
+
+def test_pending_output_is_kept_when_a_process_holds_the_pipe() -> None:
+    @dawgz.job
+    def hold() -> None:
+        # A process inheriting the streams, which outlives the job
+        subprocess.Popen(["sleep", "3"])
+        sys.stderr.write("\rprogress 50%")
+        sys.stderr.write("\rprogress 100%\n")
+        print("last line")
+
+    job = hold()
+    scheduler = dawgz.schedule(job, backend="local", quiet=True)
+
+    assert scheduler.logs(job).splitlines()[-2:] == ["progress 100%", "last line"]
