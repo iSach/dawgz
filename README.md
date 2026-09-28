@@ -179,7 +179,7 @@ Options of other backends are ignored, such that you can switch backends with `D
 
 ## Logs and disk usage
 
-Log files are kept small: carriage-return redraws (e.g. `tqdm` bars refreshing 10 times per second) are collapsed as they are written, and saved at most every 10 seconds (`DAWGZ_LOG_INTERVAL`) instead of accumulating megabytes of redraws. Set `DAWGZ_RAW_LOGS=1` in the environment of a job to disable this.
+Log files are kept small: redrawn lines (e.g. `tqdm` bars refreshing 10 times per second, including nested bars) are collapsed as they are written, and saved at most every 10 seconds (`DAWGZ_LOG_INTERVAL`) instead of accumulating megabytes of redraws. Set `DAWGZ_RAW_LOGS=1` in the environment of a job to disable this.
 
 To free disk space, `dawgz du` shows the size of workflows (logs and pickles) and `dawgz clean` deletes or shrinks them. Workflows with pending or running jobs are skipped unless `--force` is given.
 
@@ -296,7 +296,17 @@ Measured with [`benchmarks/bench.py`](benchmarks/bench.py) on a fake Slurm where
 | `dawgz <wf>` (cold cache) | 3.89 s (50 `sacct`) | 0.13 s (1 `sacct`) |
 | `dawgz <wf>` (warm cache) | 3.86 s (50 `sacct`) | 0.05 s (0 `sacct`) |
 
-`import dawgz` and the CLI import no third-party package (not even `cloudpickle` for monitoring). Most of the remaining time of a submission is usually the import of your own script (e.g. `import torch`). Import heavy packages inside job functions if you submit often.
+`import dawgz` and the CLI import no third-party package (not even `cloudpickle` for monitoring).
+
+With heavy imports, most of the time of a submission is the import of your own script. With the same 50 jobs and PyTorch (`import torch` takes 1.5 s here):
+
+| 50 jobs using PyTorch | dawgz 2.7 | dawgz 3 |
+|---|---|---|
+| `import torch` at the top of the script | 5.87 s | 1.65 s |
+| `import torch` inside the job function | | 0.18 s |
+| a global 16 MB model used by the jobs | 6.28 s, 764 MB on disk | 1.67 s, 16 MB on disk |
+
+Global variables used by job functions are pickled with them. `dawgz` stores each distinct function once per workflow (instead of once per job), and warns when jobs capture large objects, naming them. Create large objects inside jobs or load them from files, and import heavy packages inside job functions if you submit often.
 
 ## Development
 

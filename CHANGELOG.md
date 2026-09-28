@@ -6,7 +6,7 @@
 
 * **Much faster submission and monitoring.** Independent `sbatch` calls run concurrently, and independent jobs with identical settings and dependencies are packed into a single job array (one task per job, with per-job logs, states and dependencies). Monitors read lightweight JSON records instead of unpickling workflows, and query Slurm with a single batched and cached `sacct` call. With 50 jobs and a 50 ms Slurm latency: submission 4.18 s → 0.18 s, `dawgz <wf>` 3.89 s → 0.13 s (cold) and 0.05 s (warm), 50 → 1 → 0 `sacct` calls.
 * **Progress reporting.** `dawgz.progress`, `dawgz.Progress` and `dawgz.status` report live progress from jobs, and `tqdm` bars in job outputs are recognized automatically.
-* **Compact logs.** Carriage-return redraws (e.g. `tqdm` bars) are collapsed before reaching log files. `dawgz du` and `dawgz clean` show and free disk usage.
+* **Compact logs and records.** Redrawn lines (e.g. `tqdm` bars, nested or not) are collapsed before reaching log files. Job functions (and the global variables they capture, e.g. a model) are stored once per workflow instead of once per job: 50 jobs using a global 16 MB model took 764 MB, now 16 MB, and a `LargeJobWarning` names the culprits. `dawgz du` and `dawgz clean` show and free disk usage.
 * **New CLI** without third-party dependencies: dependency graph, grouped fan-outs with stacked progress bars, job details with progress and log tails, `logs -f`, `cancel`, `du`, `clean`, `--json`, `--watch`, references by index, name or ID.
 * **`dawgz-tui`**, an interactive terminal interface written in Rust (ratatui), with workflows, jobs, arrays, timeline, graph, logs, search, filters, cancellation and a Slurm queue view.
 * **Sequential local execution by default.** The new `local` backend runs each job in a fresh process, one at a time (`workers=1`) in the order listed by `dawgz`, or in parallel with `workers=N`.
@@ -34,6 +34,7 @@
 * Submission errors were displayed as `CANCELLED` instead of `FAILED`.
 * Invalid CLI references raised raw tracebacks; they now print an error and exit with code 2.
 * Generating workflow IDs took about 0.2 s (and could produce odd words).
+* Every job pickle embedded a copy of the global variables used by its function.
 
 ### Changes
 
