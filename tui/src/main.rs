@@ -40,6 +40,7 @@ OPTIONS:
     --select <N>         initially selected workflow
     --row <N>            initially selected job row (focuses the main pane)
     --expand             expand the selected row
+    --queue              open the Slurm queue view
     -V, --version        print version
     -h, --help           print help
 
@@ -59,6 +60,7 @@ struct Args {
     select: Option<usize>,
     row: Option<usize>,
     expand: bool,
+    queue: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -76,6 +78,7 @@ fn parse_args() -> Result<Args, String> {
         select: None,
         row: None,
         expand: false,
+        queue: false,
     };
 
     let mut it = std::env::args().skip(1);
@@ -113,6 +116,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--row" => args.row = Some(value("--row")?.parse().map_err(|_| "invalid row")?),
             "--expand" => args.expand = true,
+            "--queue" => args.queue = true,
             "-V" | "--version" => {
                 println!("dawgz-tui {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -171,6 +175,9 @@ fn setup(app: &mut App, args: &Args) {
             }
         }
     }
+    if args.queue {
+        app.queue.open = true;
+    }
     app.reload_log(true);
 }
 
@@ -198,6 +205,14 @@ fn main() {
             app.refresh_now();
         }
         setup(&mut app, &args);
+        if args.queue && !args.offline {
+            match sacct::queue() {
+                Ok(jobs) => app.queue.jobs = jobs,
+                Err(e) => app.queue.error = Some(e),
+            }
+            app.queue.last = store::now();
+            app.queue.calls = 1;
+        }
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("backend");
         terminal.draw(|f| ui::draw(f, &mut app)).expect("draw");
         print!("{}", to_ansi(terminal.backend().buffer()));
@@ -522,6 +537,17 @@ mod tests {
         let text = render(&mut app, 120, 40);
         assert!(text.contains("dawgz help"));
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolves_queue_owners() {
+        let dir = fixture("owner");
+        let app = App::new(theme::Theme::mocha(), vec![dir.clone()], false, 30.0, true);
+        assert_eq!(app.owner("101_3"), Some(("demo.py".into(), "task(4)".into())));
+        assert_eq!(app.owner("102_2"), Some(("demo.py".into(), "train[2]".into())));
+        assert_eq!(app.owner("101_[5-9]").map(|o| o.1), Some("task ×5".into()));
+        assert_eq!(app.owner("999"), None);
         let _ = fs::remove_dir_all(dir);
     }
 

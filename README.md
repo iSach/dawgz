@@ -142,6 +142,8 @@ Commands accept `--json` for machine-readable output, `--refresh` to query Slurm
 
 `dawgz tui` (or `dawgz-tui`) opens an interactive dashboard of your workflows: workflow cards with live progress, a jobs table with a dependency graph and expandable fan-outs and arrays, array heatmaps, per-job progress bars, a timeline, a graph view, logs with follow mode, submission scripts and sources, fuzzy search (`/`), filters (`a` active only, `s` state), cancellation (`c`) and more (`?`). Without workflows in the current directory, it shows those of all the directories where you ran `dawgz` (`D` toggles).
 
+`Q` opens the Slurm queue of all your jobs, dawgz or not, where jobs of dawgz workflows are shown by workflow and job name. The queue is fetched with a single `squeue -u $USER` when opened, and then at most once per minute while it is open.
+
 ![dawgz-tui graph](docs/images/tui-graph.png)
 
 ### Progress

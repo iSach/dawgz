@@ -49,7 +49,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_sidebar(f, app, sidebar, &t);
     }
     if main.width > 0 {
-        draw_main(f, app, main, &t);
+        if app.queue.open {
+            draw_queue(f, app, main, &t);
+        } else {
+            draw_main(f, app, main, &t);
+        }
     }
     draw_footer(f, app, footer, &t);
     draw_toasts(f, app, area, &t);
@@ -2497,6 +2501,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 ("/", "search"),
                 ("a", "active"),
                 ("D", "all dirs"),
+                ("Q", "queue"),
                 ("c", "cancel"),
             ],
             (Focus::Main, Tab::Jobs) => vec![
@@ -2632,6 +2637,7 @@ fn draw_popup(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 ("a", "active workflows only"),
                 ("s", "cycle job state filter"),
                 ("D", "workflows of all known directories"),
+                ("Q", "Slurm queue of all your jobs (squeue)"),
                 ("", ""),
                 ("Actions", ""),
                 ("r", "query Slurm now (at most every 5 s)"),
@@ -2676,4 +2682,161 @@ fn draw_popup(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             f.render_widget(Paragraph::new(lines).block(block), rect);
         }
     }
+}
+
+fn draw_queue(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
+    let q = &app.queue;
+    let now = now();
+    let mut title = vec![Span::raw(" ")];
+    title.extend(pill(" Slurm queue ", t.bg, t.mauve, t.bg));
+    title.push(Span::styled(
+        format!(" {} ", std::env::var("USER").unwrap_or_default()),
+        t.sub(),
+    ));
+    let block = panel(t, title, true);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let [head, _, table, foot] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    // Summary
+    let mut by_state: Vec<(String, usize)> = Vec::new();
+    for job in &q.jobs {
+        match by_state.iter_mut().find(|(s, _)| *s == job.state) {
+            Some((_, n)) => *n += 1,
+            None => by_state.push((job.state.clone(), 1)),
+        }
+    }
+    let mut left = vec![Span::styled(format!(" {} jobs  ", q.jobs.len()), t.bold())];
+    for (state, n) in &by_state {
+        let cat = Cat::of(state);
+        left.push(Span::styled(
+            format!("{} {n} {}  ", glyph(cat, app.tick), state.to_lowercase()),
+            Style::default().fg(t.state(state)),
+        ));
+    }
+    let right = if q.inflight {
+        vec![Span::styled(
+            format!("{} squeue ", widgets::spinner(app.tick)),
+            Style::default().fg(t.yellow),
+        )]
+    } else if let Some(e) = &q.error {
+        vec![Span::styled(
+            format!("⚠ {} ", truncate(e, 40)),
+            Style::default().fg(t.red),
+        )]
+    } else if q.last > 0.0 {
+        vec![Span::styled(
+            format!(
+                "⟳ {} ago · auto every {} ",
+                age(q.last, now),
+                duration(crate::app::QUEUE_INTERVAL)
+            ),
+            t.dim(),
+        )]
+    } else {
+        vec![]
+    };
+    f.render_widget(
+        Paragraph::new(line_lr(left, right, head.width as usize)),
+        head,
+    );
+
+    // Table
+    let width = table.width as usize;
+    let name_w = width
+        .saturating_sub(4 + 15 + 9 + 11 + 10 + 10 + 4 + 16)
+        .clamp(16, 40);
+    let header = format!(
+        "    {:<14} {:<8} {:<name_w$} {:<10} {:>9} {:>9} {:>3} {}",
+        "JOBID", "PART.", "NAME", "STATE", "TIME", "LIMIT", "N", "REASON / NODES"
+    );
+    let rest = width.saturating_sub(4 + 15 + 9 + name_w + 1 + 10 + 10 + 10 + 4);
+    let mut lines = vec![Line::from(Span::styled(truncate(&header, width), t.dim()))];
+    let visible = table.height.saturating_sub(1) as usize;
+    let offset = q.selected.saturating_sub(visible.saturating_sub(1));
+
+    for (k, job) in q.jobs.iter().enumerate().skip(offset).take(visible) {
+        let selected = k == q.selected;
+        let bg = if selected { t.surface } else { t.bg };
+        let cat = Cat::of(&job.state);
+        let bold = if cat == Cat::Running {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        };
+        let mut spans = vec![
+            Span::styled(
+                if selected { "▌" } else { " " },
+                Style::default().fg(t.accent),
+            ),
+            Span::styled(
+                format!(" {} ", glyph(cat, app.tick)),
+                Style::default().fg(t.state(&job.state)),
+            ),
+            Span::styled(
+                format!("{:<14} ", truncate(&job.id, 14)),
+                Style::default().fg(t.subtext),
+            ),
+            Span::styled(format!("{:<8} ", truncate(&job.partition, 8)), t.dim()),
+        ];
+
+        // Jobs of dawgz workflows are shown as "workflow › job"
+        let name = match app.owner(&job.id) {
+            Some((wf, label)) => vec![
+                Span::styled("◆ ", Style::default().fg(t.accent)),
+                Span::styled(format!("{wf} › "), Style::default().fg(t.accent2)),
+                Span::styled(label, Style::default().fg(t.text).add_modifier(bold)),
+            ],
+            None => vec![Span::styled(
+                job.name.clone(),
+                Style::default().fg(t.text).add_modifier(bold),
+            )],
+        };
+        let name = clip(name, name_w);
+        let used = spans_width(&name);
+        spans.extend(name);
+        spans.push(Span::raw(" ".repeat(name_w.saturating_sub(used) + 1)));
+        spans.extend([
+            Span::styled(
+                format!("{:<10}", truncate(&job.state.to_lowercase(), 10)),
+                Style::default().fg(t.state(&job.state)),
+            ),
+            Span::styled(format!("{:>9} ", job.time), Style::default().fg(t.text)),
+            Span::styled(format!("{:>9} ", job.limit), t.dim()),
+            Span::styled(format!("{:>3} ", job.nodes), t.dim()),
+            Span::styled(truncate(&job.reason, rest.max(8)), t.dim()),
+        ]);
+        lines.push(Line::from(spans).style(Style::default().bg(bg)));
+    }
+    if q.jobs.is_empty() {
+        let text = if q.inflight || q.last == 0.0 {
+            "loading…"
+        } else {
+            "no job in the queue"
+        };
+        lines.push(Line::from(Span::styled(format!("  {text}"), t.dim())));
+    }
+    f.render_widget(Paragraph::new(lines), table);
+
+    let mut hints = Vec::new();
+    for (k, label) in [
+        ("↑↓", "select"),
+        ("c", "cancel"),
+        ("r", "refresh"),
+        ("Q/esc", "back"),
+    ] {
+        hints.extend(key(t, k, label));
+    }
+    hints.push(Span::styled(
+        format!("{} squeue calls this session", q.calls),
+        t.dim(),
+    ));
+    f.render_widget(Paragraph::new(Line::from(hints)), foot);
 }

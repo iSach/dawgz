@@ -74,6 +74,9 @@ pub enum Action {
         job: Option<usize>,
         i: Option<usize>,
     },
+    Scancel {
+        id: String,
+    },
 }
 
 pub struct Toast {
@@ -111,15 +114,37 @@ pub struct Areas {
     pub main: Rect,
 }
 
-struct Request {
-    uids: Vec<String>,
-    jobids: Vec<String>,
+enum Request {
+    Sacct {
+        uids: Vec<String>,
+        jobids: Vec<String>,
+    },
+    Queue,
 }
 
-struct Response {
-    uids: Vec<String>,
-    when: f64,
-    result: Result<HashMap<String, serde_json::Value>, String>,
+enum Response {
+    Sacct {
+        uids: Vec<String>,
+        when: f64,
+        result: Result<HashMap<String, serde_json::Value>, String>,
+    },
+    Queue {
+        when: f64,
+        result: Result<Vec<sacct::QueueJob>, String>,
+    },
+}
+
+/// State of the Slurm queue view.
+#[derive(Default)]
+pub struct Queue {
+    pub open: bool,
+    pub jobs: Vec<sacct::QueueJob>,
+    pub selected: usize,
+    pub last: f64,
+    pub forced: f64,
+    pub inflight: bool,
+    pub error: Option<String>,
+    pub calls: usize,
 }
 
 pub struct App {
@@ -159,6 +184,7 @@ pub struct App {
     pub sacct_error: Option<String>,
     pub sacct_last: f64,
     pub sacct_calls: usize,
+    pub queue: Queue,
     last_forced: f64,
     known: HashMap<(String, usize), Cat>,
     finished: HashSet<String>,
@@ -223,6 +249,7 @@ impl App {
             sacct_error: None,
             sacct_last: 0.0,
             sacct_calls: 0,
+            queue: Queue::default(),
             last_forced: 0.0,
             known: HashMap::new(),
             finished: HashSet::new(),
@@ -272,15 +299,18 @@ impl App {
         std::thread::spawn(move || {
             while let Ok(req) = rx_req.recv() {
                 let when = now();
-                let result = sacct::query(&req.jobids);
-                if tx_res
-                    .send(Response {
-                        uids: req.uids,
+                let response = match req {
+                    Request::Sacct { uids, jobids } => Response::Sacct {
+                        uids,
                         when,
-                        result,
-                    })
-                    .is_err()
-                {
+                        result: sacct::query(&jobids),
+                    },
+                    Request::Queue => Response::Queue {
+                        when,
+                        result: sacct::queue(),
+                    },
+                };
+                if tx_res.send(response).is_err() {
                     break;
                 }
             }
@@ -495,25 +525,46 @@ impl App {
             }
         }
         for r in responses {
-            self.sacct_inflight = false;
-            match r.result {
-                Ok(entries) => {
-                    self.sacct_error = None;
-                    self.sacct_last = r.when;
-                    for w in self
-                        .workflows
-                        .iter_mut()
-                        .filter(|w| r.uids.contains(&w.uid().to_string()))
-                    {
-                        w.update(&entries, r.when);
+            match r {
+                Response::Sacct { uids, when, result } => {
+                    self.sacct_inflight = false;
+                    self.sacct_last = when;
+                    match result {
+                        Ok(entries) => {
+                            self.sacct_error = None;
+                            for w in self
+                                .workflows
+                                .iter_mut()
+                                .filter(|w| uids.contains(&w.uid().to_string()))
+                            {
+                                w.update(&entries, when);
+                            }
+                            self.after_reload();
+                        }
+                        Err(e) => self.sacct_error = Some(e),
                     }
-                    self.after_reload();
                 }
-                Err(e) => {
-                    self.sacct_error = Some(e);
-                    self.sacct_last = r.when;
+                Response::Queue { when, result } => {
+                    self.queue.inflight = false;
+                    self.queue.last = when;
+                    match result {
+                        Ok(jobs) => {
+                            self.queue.error = None;
+                            self.queue.jobs = jobs;
+                            self.queue.selected = self
+                                .queue
+                                .selected
+                                .min(self.queue.jobs.len().saturating_sub(1));
+                        }
+                        Err(e) => self.queue.error = Some(e),
+                    }
                 }
             }
+        }
+
+        // The queue view refreshes itself at most once a minute
+        if self.queue.open && !self.queue.inflight && now() - self.queue.last >= QUEUE_INTERVAL {
+            self.request_queue();
         }
 
         // Files: selected workflow every second, others every 5 seconds
@@ -681,10 +732,100 @@ impl App {
         }
 
         if let Some(tx) = &self.tx {
-            if tx.send(Request { uids, jobids }).is_ok() {
+            if tx.send(Request::Sacct { uids, jobids }).is_ok() {
                 self.sacct_inflight = true;
                 self.sacct_calls += 1;
             }
+        }
+    }
+
+    fn request_queue(&mut self) {
+        if self.offline {
+            self.queue.error = Some("offline".into());
+            return;
+        }
+        if let Some(tx) = &self.tx {
+            if tx.send(Request::Queue).is_ok() {
+                self.queue.inflight = true;
+                self.queue.calls += 1;
+            }
+        }
+    }
+
+    /// Workflow and job of a Slurm job ID, if it belongs to a dawgz workflow.
+    pub fn owner(&self, id: &str) -> Option<(String, String)> {
+        let base = id.split('_').next().unwrap_or(id);
+        let mut fallback = None;
+        for w in &self.workflows {
+            for job in w.jobs() {
+                let Some(jobid) = &job.jobid else { continue };
+                if jobid == id {
+                    // e.g. a packed job "12_3"
+                    let label = if job.is_array() {
+                        job.label()
+                    } else {
+                        job.input.lines().next().unwrap_or(&job.name).to_string()
+                    };
+                    return Some((w.name().to_string(), label));
+                }
+                if fallback.is_none() && jobid.split('_').next() == Some(base) {
+                    let label = if job.is_array() {
+                        // An element of an array, e.g. "12_3" of "12"
+                        match id.split_once('_') {
+                            Some((_, i)) => format!("{}[{i}]", job.name),
+                            None => job.label(),
+                        }
+                    } else {
+                        format!(
+                            "{} ×{}",
+                            job.name,
+                            w.jobs()
+                                .iter()
+                                .filter(|j| j
+                                    .jobid
+                                    .as_deref()
+                                    .is_some_and(|x| x.split('_').next() == Some(base)))
+                                .count()
+                        )
+                    };
+                    fallback = Some((w.name().to_string(), label));
+                }
+            }
+        }
+        fallback
+    }
+
+    fn queue_key(&mut self, key: KeyEvent) {
+        let n = self.queue.jobs.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('Q') => self.queue.open = false,
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('?') => self.popup = Some(Popup::Help),
+            KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                self.queue.selected = (self.queue.selected + 1).min(n - 1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.queue.selected = self.queue.selected.saturating_sub(1)
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.queue.selected = 0,
+            KeyCode::Char('G') | KeyCode::End => self.queue.selected = n.saturating_sub(1),
+            KeyCode::Char('r') => {
+                if now() - self.queue.forced < 10.0 {
+                    self.flash("squeue was queried less than 10 seconds ago");
+                } else if !self.queue.inflight {
+                    self.queue.forced = now();
+                    self.request_queue();
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(job) = self.queue.jobs.get(self.queue.selected) {
+                    self.popup = Some(Popup::Confirm {
+                        message: format!("Cancel Slurm job {} ({})?", job.id, job.name),
+                        action: Action::Scancel { id: job.id.clone() },
+                    });
+                }
+            }
+            _ => {}
         }
     }
 
@@ -761,6 +902,11 @@ impl App {
                     _ => self.popup = Some(Popup::Confirm { message, action }),
                 },
             }
+            return;
+        }
+
+        if self.queue.open && !self.search.active {
+            self.queue_key(key);
             return;
         }
 
@@ -860,6 +1006,12 @@ impl App {
                 });
             }
             KeyCode::Char('r') => self.maybe_refresh(true),
+            KeyCode::Char('Q') => {
+                self.queue.open = true;
+                if !self.queue.inflight && now() - self.queue.last >= 10.0 {
+                    self.request_queue();
+                }
+            }
             KeyCode::Char('c') => self.ask_cancel(),
             KeyCode::Char('y') => self.copy_jobid(),
             KeyCode::Char('f') if self.tab == Tab::Logs => {
@@ -1161,6 +1313,22 @@ impl App {
                 }
                 self.after_reload();
             }
+            Action::Scancel { id } => {
+                let out = std::process::Command::new("scancel")
+                    .arg("-v")
+                    .arg(&id)
+                    .output();
+                let message = match out {
+                    Ok(o) => String::from_utf8_lossy(&o.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("cancelled")
+                        .to_string(),
+                    Err(e) => format!("scancel failed: {e}"),
+                };
+                self.flash(message);
+                self.queue.last = 0.0; // refresh on the next tick
+            }
         }
     }
 
@@ -1245,6 +1413,9 @@ impl App {
         }
     }
 }
+
+/// Seconds between two automatic `squeue` calls while the queue view is open.
+pub const QUEUE_INTERVAL: f64 = 60.0;
 
 fn widgets_fuzzy(query: &str, text: &str) -> bool {
     crate::widgets::fuzzy(query, text).is_some()

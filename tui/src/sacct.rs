@@ -231,3 +231,64 @@ mod tests {
         assert_eq!(expand("1,4-5"), vec![1, 4, 5]);
     }
 }
+
+/// A job of the Slurm queue (`squeue`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct QueueJob {
+    pub id: String,
+    pub partition: String,
+    pub name: String,
+    pub state: String,
+    pub time: String,
+    pub limit: String,
+    pub nodes: String,
+    pub reason: String,
+}
+
+/// Lists the jobs of the current user with a single `squeue` call.
+pub fn queue() -> Result<Vec<QueueJob>, String> {
+    let user = std::env::var("USER").unwrap_or_default();
+    let mut cmd = Command::new("squeue");
+    if !user.is_empty() {
+        cmd.args(["-u", &user]);
+    }
+    let out = cmd
+        .args(["-h", "-o", "%i|%P|%j|%T|%M|%l|%D|%R"])
+        .output()
+        .map_err(|e| format!("squeue: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(parse_queue(&String::from_utf8_lossy(&out.stdout)))
+}
+
+pub fn parse_queue(text: &str) -> Vec<QueueJob> {
+    text.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split('|').collect();
+            (f.len() >= 8).then(|| QueueJob {
+                id: f[0].trim().to_string(),
+                partition: f[1].trim().to_string(),
+                name: f[2].trim().to_string(),
+                state: f[3].trim().to_string(),
+                time: f[4].trim().to_string(),
+                limit: f[5].trim().to_string(),
+                nodes: f[6].trim().to_string(),
+                reason: f[7..].join("|").trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn parses_squeue() {
+        let jobs = parse_queue("12_[3-9]|gpu|0001_train|PENDING|0:00|1:00:00|1|(Priority)\n13|cpu|job|RUNNING|1:02|UNLIMITED|2|node[1-2]\nbad line\n");
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].id, "12_[3-9]");
+        assert_eq!(jobs[1].reason, "node[1-2]");
+    }
+}

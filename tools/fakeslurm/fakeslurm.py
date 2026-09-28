@@ -15,6 +15,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -444,13 +445,58 @@ def scancel(argv: list[str]) -> None:
 
 
 def squeue(argv: list[str]) -> None:
-    print(f"{'JOBID':>12} {'NAME':<24} {'ST':<3}")
+    fmt = "%.18i %.9P %.8j %.8u %.2t %.10M %.6D %R"
+    header = True
+    it = iter(argv)
+    for a in it:
+        if a in ("-o", "--format"):
+            fmt = next(it)
+        elif a.startswith("--format="):
+            fmt = a.split("=", 1)[1]
+        elif a in ("-h", "--noheader"):
+            header = False
+
+    def fields(jobid: str, job: dict, task: dict) -> dict[str, str]:
+        start = task.get("start")
+        elapsed = fmt_duration(time.time() - start) if start else "0:00"
+        state = task["state"]
+        reason = task.get("reason") or ("None" if state == "RUNNING" else "Priority")
+        return {
+            "i": jobid,
+            "P": "fake",
+            "j": job["name"],
+            "u": os.environ.get("USER", "user"),
+            "T": state,
+            "t": {"PENDING": "PD", "RUNNING": "R"}.get(state, state[:2]),
+            "M": elapsed,
+            "l": job.get("time") or "UNLIMITED",
+            "D": "1",
+            "R": task.get("node", "fake-node1") if state == "RUNNING" else f"({reason})",
+        }
+
+    rows = []
     for file in sorted((root() / "jobs").glob("*.json")):
         job = json.loads(file.read_text())
+        pending = []
         for t, v in job["tasks"].items():
-            if v["state"] in ("PENDING", "RUNNING"):
-                jobid = job["id"] + (f"_{t}" if t else "")
-                print(f"{jobid:>12} {job['name']:<24} {v['state'][:2]:<3}")
+            if v["state"] == "RUNNING":
+                rows.append(fields(job["id"] + (f"_{t}" if t else ""), job, v))
+            elif v["state"] == "PENDING":
+                pending.append((t, v))
+        if pending:
+            if job["array"] is None:
+                rows.append(fields(job["id"], job, pending[0][1]))
+            else:
+                spec = collapse(sorted(int(t) for t, _ in pending))
+                rows.append(fields(f"{job['id']}_[{spec}]", job, pending[0][1]))
+
+    def render(row: dict[str, str]) -> str:
+        return re.sub(r"%\.?\d*([a-zA-Z])", lambda m: row.get(m.group(1), ""), fmt)
+
+    if header:
+        print(render({k: k.upper() for k in "iPjutTMlDR"}))
+    for row in rows:
+        print(render(row))
 
 
 def main() -> None:
