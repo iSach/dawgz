@@ -251,3 +251,22 @@ def test_map_pickles_once(monkeypatch: pytest.MonkeyPatch) -> None:
 
     [append("x", i) for i in range(3)]
     assert len(calls) == 4
+
+
+def test_spawn_many_jobs() -> None:
+    jobs = [dawgz.job(lambda: None, name="x")() for _ in range(40)]
+    scheduler = dawgz.schedule(*jobs, backend="local", start="spawn", workers=8, quiet=True)
+    assert all(scheduler.state(j) == "COMPLETED" for j in jobs)
+
+
+def test_array_trace_of_first_failure() -> None:
+    @dawgz.job
+    def flaky(i: int) -> None:
+        if i == 0:
+            raise ValueError("element zero failed")
+        time.sleep(0.3)
+
+    array = flaky.map(range(2), array=True)
+    scheduler = dawgz.schedule(array, backend="local", workers=2, quiet=True)
+
+    assert "element zero failed" in scheduler.traces[array]

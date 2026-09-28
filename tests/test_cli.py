@@ -404,3 +404,61 @@ def test_cancel_local(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
 
     _, out, _ = run(capsys, "cancel", "0")
     assert "nothing to cancel" in out
+
+
+def test_cancel_local_kills_subprocesses(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    import os
+    import subprocess
+
+    marker = tmp_path / "pid"
+    script = tmp_path / "long.py"
+    script.write_text(
+        "import subprocess, time\n"
+        "import dawgz\n"
+        "@dawgz.job\n"
+        "def nap():\n"
+        f"    p = subprocess.Popen(['sleep', '60']); open({str(marker)!r}, 'w').write(str(p.pid)); p.wait()\n"
+        "dawgz.schedule(nap(), backend='local', quiet=True)\n"
+    )
+    env = {**os.environ, "DAWGZ_DIR": str(dawgz.get_dawgz_dir())}
+    proc = subprocess.Popen([sys.executable, str(script)], env=env)
+
+    try:
+        deadline = time.time() + 20
+        while not (marker.exists() and marker.read_text()) and time.time() < deadline:
+            time.sleep(0.05)
+        sleeper = int(marker.read_text())
+
+        run(capsys, "cancel", "0")
+        proc.wait(timeout=20)
+
+        time.sleep(0.2)
+        with pytest.raises(ProcessLookupError):
+            os.kill(sleeper, 0)
+    finally:
+        proc.kill()
+
+
+def test_destructive_commands_need_unambiguous_references(capsys: pytest.CaptureFixture) -> None:
+    for _ in range(2):
+        dawgz.schedule(noop(), backend="local", name="same", quiet=True)
+
+    code, _, err = run(capsys, "clean", "same", "-y")
+    assert code == 2
+    assert "matches 2 workflows" in err
+    assert len(store.registry(dawgz.get_dawgz_dir())) == 2
+
+    code, _, _ = run(capsys, "same")  # showing picks the most recent
+    assert code == 0
+
+
+def test_registry_ignores_unsafe_ids(capsys: pytest.CaptureFixture) -> None:
+    dawgz.schedule(noop(), backend="local", name="ok", quiet=True)
+    with open(dawgz.get_dawgz_dir() / "workflows.csv", "a") as f:
+        f.write("evil,..,2026-01-01,local,1,0\nempty,,2026-01-01,local,1,0\n")
+
+    assert [r["name"] for r in store.registry(dawgz.get_dawgz_dir())] == ["ok"]
+
+    code, _, _ = run(capsys, "clean", "--keep", "0", "-y")
+    assert code == 0
+    assert dawgz.get_dawgz_dir().exists()

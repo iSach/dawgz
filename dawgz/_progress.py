@@ -53,6 +53,7 @@ class Progress(Generic[T]):
             except TypeError:
                 total = None
 
+        self.key = f"p{id(self):x}"
         self.iterable = iterable
         self.total = total
         self.desc = desc or "progress"
@@ -142,7 +143,7 @@ class Progress(Generic[T]):
                     fields["eta"] = max(self.total - self.n, 0) / rate
             if self.postfix:
                 fields["postfix"] = self._postfix()
-            self.run.bar(self.desc, **fields)
+            self.run.bar(self.key, desc=self.desc, **fields)
 
         if self._tty:
             now = time.monotonic()

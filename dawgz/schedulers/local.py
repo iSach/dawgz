@@ -100,6 +100,7 @@ class LocalScheduler(Scheduler):
         running: dict[int, tuple[Job, int | None]] = {}
         remaining: dict[Job, int] = {}
         failures: dict[Job, int] = {}
+        first_failure: dict[Job, dict] = {}
         started = 0
 
         handler = None
@@ -180,11 +181,13 @@ class LocalScheduler(Scheduler):
 
                 remaining[job] -= 1
                 failures[job] += code != 0
+                if code != 0:
+                    first_failure.setdefault(job, run)
 
                 if remaining[job] == 0:
                     if failures[job]:
                         outcomes[job] = "failure"
-                        self._failed(job, i, run)
+                        self._failed(job, i, first_failure[job])
                     else:
                         outcomes[job] = "success"
                         self.results[job] = None
@@ -225,8 +228,6 @@ class LocalScheduler(Scheduler):
         return pid
 
     def _spawn_process(self, data: bytes, logfile: object, runfile: object, tty: bool) -> int:
-        import subprocess
-
         pklfile = str(runfile).replace(".run.json", ".local.pkl")
         with open(pklfile, "wb") as f:
             f.write(data)
@@ -236,12 +237,12 @@ class LocalScheduler(Scheduler):
         paths = [p for p in sys.path if p]
         env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(paths))
 
-        # The process is reaped with `os.waitpid`, like forked ones
-        process = subprocess.Popen(
+        # Reaped with `os.waitpid`, like forked processes (no `Popen` bookkeeping)
+        return os.posix_spawn(
+            sys.executable,
             [sys.executable, "-c", code, pklfile, str(logfile), str(runfile)],
-            env=env,
+            env,
         )
-        return process.pid
 
     def _set(self, job: Job, i: int | None, **fields) -> None:
         entry = self.entries[self.order[job]]
@@ -298,11 +299,15 @@ class LocalScheduler(Scheduler):
             _eprint(term.style(f"▶ [{k}/{n}] {job!r}{size}", "cyan"))
 
     def _interrupt(self, running: dict, queue: list, waiting: list) -> None:
-        for pid in running:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
+        # Jobs, and the processes they started
+        family = {pid: descendants(pid) for pid in running}
+
+        for pid, children in family.items():
+            for p in [pid, *children]:
+                try:
+                    os.kill(p, signal.SIGTERM)
+                except OSError:
+                    pass
 
         deadline = time.monotonic() + 5.0
         while running and time.monotonic() < deadline:
@@ -320,6 +325,13 @@ class LocalScheduler(Scheduler):
                 os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
+
+        for children in family.values():
+            for p in children:
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except OSError:
+                    pass
 
         for entry in self.entries.values():
             for e in [entry, *entry.get("tasks", {}).values()]:
@@ -383,6 +395,35 @@ def _spawned(pklfile: str, logfile: str, runfile: str) -> None:
         data = f.read()
     os.remove(pklfile)
     sys.exit(_child(data, logfile, runfile))
+
+
+def descendants(pid: int) -> list[int]:
+    r"""Lists the descendants of a process (Linux), such that they can be terminated."""
+
+    parents: dict[int, list[int]] = {}
+
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        parents.setdefault(ppid, []).append(int(entry))
+
+    out, stack = [], [pid]
+    while stack:
+        for child in parents.get(stack.pop(), []):
+            out.append(child)
+            stack.append(child)
+
+    return out
 
 
 def describe_exit(code: int) -> str:

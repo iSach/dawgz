@@ -123,6 +123,7 @@ class Scheduler(ABC):
             "host": socket.gethostname(),
             "user": _user(),
             "pid": os.getpid(),
+            "pid_start": store.pid_start(os.getpid()),
             "jobs": jobs,
             "sources": list(sources),
         }

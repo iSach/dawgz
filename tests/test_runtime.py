@@ -4,6 +4,7 @@ import os
 import pytest
 import subprocess
 import sys
+import time
 
 from pathlib import Path
 
@@ -214,3 +215,91 @@ def test_runner_without_dawgz(tmp_path: Path, fake_slurm: Path) -> None:
     )
 
     assert store.log_file(scheduler.path, "0001_p").read_text() == "packed\n"
+
+
+def test_nested_tqdm_bars() -> None:
+    tqdm = pytest.importorskip("tqdm")
+
+    @dawgz.job
+    def nested() -> None:
+        for _ in tqdm.tqdm(range(3), desc="epochs", mininterval=0):
+            for _ in tqdm.tqdm(range(200), desc="batches", mininterval=0, leave=False):
+                pass
+        print("done")
+
+    job = nested()
+    scheduler = dawgz.schedule(job, backend="local", quiet=True)
+
+    logfile = store.log_file(scheduler.path, "0000_nested")
+    lines = cat(logfile.read_text(), -1).strip().splitlines()
+
+    # 600 redraws of the inner bar would write 600 lines
+    assert len(lines) < 10
+    assert lines[-1] == "done"
+    assert "\x1b[A" not in logfile.read_text()
+
+    run = store.read_json(store.run_file(scheduler.path, "0000_nested"))
+    descs = {bar["desc"] for bar in run["progress"]}
+    assert "epochs" in descs
+
+
+def test_malformed_bar_does_not_hang() -> None:
+    @dawgz.job
+    def weird() -> None:
+        sys.stderr.write("\rcopy: 5%|#| 1.2.3/10 [00:01<00:02, 1.00it/s]")
+        for i in range(5000):
+            print(f"line {i}")
+
+    job = weird()
+    start = time.time()
+    scheduler = dawgz.schedule(job, backend="local", quiet=True)
+
+    assert time.time() - start < 10
+    assert scheduler.state(job) == "COMPLETED"
+    assert scheduler.logs(job).endswith("line 4999")
+
+
+def test_leftover_process_does_not_corrupt_records() -> None:
+    @dawgz.job
+    def spawn() -> None:
+        subprocess.Popen([
+            "sh",
+            "-c",
+            "for i in 1 2 3 4 5 6 7 8 9 10; do echo daemon; sleep 0.1; done",
+        ])
+        print("parent done")
+
+    job = spawn()
+    scheduler = dawgz.schedule(job, backend="local", quiet=True)
+
+    run = store.read_json(store.run_file(scheduler.path, "0000_spawn"))
+    assert run is not None and run["state"] == "COMPLETED"
+
+    time.sleep(1.5)
+    run = store.read_json(store.run_file(scheduler.path, "0000_spawn"))
+    assert run is not None and run["state"] == "COMPLETED"
+    assert "parent done" in scheduler.logs(job)
+
+
+def test_changing_descriptions_are_bounded() -> None:
+    @dawgz.job
+    def moving() -> None:
+        with dawgz.Progress(total=100, desc="loss ?") as bar:
+            for i in range(100):
+                bar.set_description(f"loss {1 / (i + 1):.3f}")
+                bar.update()
+        for i in range(50):
+            sys.stderr.write(f"\rstep {i}: {2 * i:3d}%|#| {i}/50 [00:00<00:00, 9.99it/s]")
+        sys.stderr.write("\n")
+
+    scheduler = dawgz.schedule(moving(), backend="local", quiet=True)
+    run = store.read_json(store.run_file(scheduler.path, "0000_moving"))
+
+    assert len(run["progress"]) <= 2
+    assert any(bar["desc"] == "loss 0.010" for bar in run["progress"])
+
+
+def test_exit_code_out_of_range() -> None:
+    job = dawgz.job(lambda: sys.exit(256), name="big_exit")()
+    scheduler = dawgz.schedule(job, backend="local", quiet=True)
+    assert scheduler.state(job) == "FAILED"

@@ -140,13 +140,26 @@ def registry(dawgz_dir: Path) -> list[dict[str, str]]:
     except OSError:
         return []
 
-    return [dict(zip(COLUMNS, row, strict=False)) for row in rows if len(row) >= 2]
+    return [
+        dict(zip(COLUMNS, row, strict=False))
+        for row in rows
+        if len(row) >= 2 and valid_uid(row[1])
+    ]
+
+
+def valid_uid(uid: str) -> bool:
+    r"""Workflow IDs are single path components (never empty, `.` or `..`)."""
+
+    return bool(uid) and uid not in (".", "..") and "/" not in uid and "\\" not in uid
 
 
 def register(dawgz_dir: Path, row: Iterable[Any]) -> None:
     dawgz_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(dawgz_dir / "workflows.csv", mode="a", newline="") as f:
+    with (
+        locked(dawgz_dir / "workflows.lock"),
+        open(dawgz_dir / "workflows.csv", mode="a", newline="") as f,
+    ):
         csv.writer(f).writerow(row)
 
     remember_dir(dawgz_dir)
@@ -309,7 +322,7 @@ class Workflow:
 
         pid, host = self.meta.get("pid"), self.meta.get("host")
 
-        if not pid or host != socket.gethostname() or pid_alive(pid):
+        if not pid or host != socket.gethostname() or pid_alive(pid, self.meta.get("pid_start")):
             return
 
         for entry in self.cache.get("jobs", {}).values():
@@ -423,13 +436,37 @@ class Workflow:
         if self.backend != "slurm" or time.time() - self.updated < ttl:
             return []
 
-        return [
-            job
-            for job in self.jobs
-            if job.get("jobid")
-            and self.inferred.get(job["index"]) not in ("wait", "never")
-            and not all(is_terminal(e["state"]) for e in self.elements(job))
-        ]
+        stale = []
+
+        for job in self.jobs:
+            if not job.get("jobid"):
+                continue
+
+            elements = self.elements(job)
+
+            # Jobs waiting for unfinished dependencies are pending
+            if self.inferred.get(job["index"]) == "wait" and all(
+                e["state"] == "PENDING" for e in elements
+            ):
+                continue
+
+            # States reported by jobs are provisional until Slurm confirms them (e.g. a
+            # failing rank, or a process killed for exceeding its memory)
+            if not all(is_terminal(e.get("state")) for e in self.cached(job)):
+                stale.append(job)
+
+        return stale
+
+    def cached(self, job: dict) -> list[dict]:
+        r"""Returns the entries of `state.json` only (without job reports)."""
+
+        entry = self.cache.get("jobs", {}).get(str(job["index"]), {})
+
+        if not job.get("array"):
+            return [entry]
+
+        tasks = entry.get("tasks", {})
+        return [tasks.get(str(i)) or {"state": entry.get("state")} for i in range(job["array"])]
 
     def update(self, entries: dict[str, dict], now: float) -> None:
         r"""Merges fresh scheduler entries (keyed by job ID) into the state cache."""
@@ -504,7 +541,7 @@ class Workflow:
                 return "nothing to cancel"
             elif host != socket.gethostname():
                 return f"the workflow runs on '{host}', cancel it from there"
-            elif not pid_alive(pid):
+            elif not pid_alive(pid, self.meta.get("pid_start")):
                 return "nothing to cancel"
 
             os.kill(pid, signal.SIGTERM)
@@ -516,7 +553,7 @@ OUTCOMES = {DONE: "success", FAILED: "failure", CANCELLED: "cancelled"}
 
 
 def readiness(job: dict, outcomes: dict[int, str | None]) -> str:
-    r"""Mirrors `dawgz.schedulers.core.readiness` for recorded jobs."""
+    r"""Mirrors the dependency semantics of Slurm for recorded jobs."""
 
     pruned = job.get("pruned", {})
     results = []
@@ -526,7 +563,8 @@ def readiness(job: dict, outcomes: dict[int, str | None]) -> str:
         if outcome is None:
             results.append(None)
         elif outcome == "cancelled":
-            results.append(False)
+            # Slurm: afterany and afternotok are satisfied by cancelled dependencies
+            results.append(status in ("any", "failure"))
         else:
             results.append(status == "any" or status == outcome)
 
@@ -577,17 +615,27 @@ def progress_fraction(entry: dict) -> float | None:
     return max(0.0, min(1.0, bar.get("n", 0) / bar["total"]))
 
 
-def pid_alive(pid: int) -> bool:
+def pid_start(pid: int) -> int | None:
+    r"""Returns the start time of a process (Linux), to detect reused PIDs."""
+
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def pid_alive(pid: int, start: int | None = None) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        return start is None
     except OSError:
         return False
 
-    return True
+    return start is None or pid_start(pid) in (None, start)
 
 
 def workflows(dawgz_dir: Path) -> list[tuple[dict, Path]]:

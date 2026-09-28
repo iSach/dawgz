@@ -42,7 +42,12 @@ def records(dawgz_dir: Path) -> list[tuple[dict, Path]]:
     return store.workflows(dawgz_dir)
 
 
-def resolve(dawgz_dir: Path, ref: str) -> tuple[int, Workflow]:
+def resolve(dawgz_dir: Path, ref: str, strict: bool = False) -> tuple[int, Workflow]:
+    r"""Finds a workflow by index, ID, ID prefix or name.
+
+    With `strict` (destructive commands), prefixes and names must be unambiguous.
+    """
+
     rows = records(dawgz_dir)
 
     if not rows:
@@ -60,14 +65,22 @@ def resolve(dawgz_dir: Path, ref: str) -> tuple[int, Workflow]:
             raise CLIError(f"workflow index {k} out of range (0 to {len(rows) - 1})")
         index = k % len(rows)
     else:
-        for j in reversed(range(len(rows))):
-            row = rows[j][0]
-            if row["uid"] == ref or row["uid"].startswith(ref) or row["name"] == ref:
-                index = j
-                break
+        exact = [j for j, (row, _) in enumerate(rows) if row["uid"] == ref]
+        matches = exact or [
+            j
+            for j, (row, _) in enumerate(rows)
+            if (ref and row["uid"].startswith(ref)) or row["name"] == ref
+        ]
 
-        if index is None:
+        if not matches:
             raise CLIError(f"no workflow matches '{ref}'")
+        elif strict and len(matches) > 1:
+            listed = ", ".join(f"{j} ({rows[j][0]['uid']})" for j in matches[-5:])
+            raise CLIError(
+                f"'{ref}' matches {len(matches)} workflows: {listed}, use an index or ID"
+            )
+
+        index = matches[-1]
 
     row, path = rows[index]
     workflow = Workflow.open(path, row)
@@ -716,7 +729,7 @@ def entry_text(
             return job["inputs"][i]
         return job.get("input", "")
     elif kind == "settings":
-        shfile = workflow.path / f"{job['tag']}.sh"
+        shfile = workflow.path / (job.get("script") or f"{job['tag']}.sh")
         if shfile.exists():
             text = shfile.read_text().strip("\n")
             return text if raw else term.highlight_shell(text)
@@ -770,11 +783,20 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 def _finished(workflow: Workflow, job: dict, i: int | None) -> bool:
     workflow.reload()
+
+    # Jobs killed by Slurm (e.g. timeout) cannot report it themselves
+    from . import sacct
+
+    try:
+        sacct.refresh([workflow])
+    except (OSError, RuntimeError):
+        pass
+
     return store.is_terminal(workflow.entry(job, i)["state"])
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
-    _, workflow = resolve(args.dir, args.workflow)
+    _, workflow = resolve(args.dir, args.workflow, strict=True)
 
     index = None
     if args.job is not None:
@@ -892,7 +914,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     targets = set()
     for ref in args.workflows:
-        k, _ = resolve(args.dir, ref)
+        k, _ = resolve(args.dir, ref, strict=True)
         targets.add(k)
 
     for k, (row, path) in enumerate(rows):
@@ -907,7 +929,8 @@ def cmd_clean(args: argparse.Namespace) -> int:
         if args.keep is not None and k >= len(rows) - args.keep:
             continue
 
-        active = False
+        # Workflows without record may be being submitted
+        active = True
         if w is not None:
             totals = w.totals()
             active = totals[RUNNING] + totals[PENDING] > 0

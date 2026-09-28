@@ -357,8 +357,12 @@ def test_progress_and_run_file(slurm_exec: None, wait_slurm: Callable, fake_slur
     before = sacct_calls(fake_slurm)
     view = store.Workflow.open(scheduler.path)
     assert view.summary(view.jobs[0])["state"] == "COMPLETED"
-    assert sacct.refresh([view], ttl=0) == 0
     assert sacct_calls(fake_slurm) == before
+
+    # but it is confirmed once by Slurm (e.g. in case another rank failed), then never again
+    assert sacct.refresh([view], ttl=0) == 1
+    assert sacct.refresh([view], ttl=0) == 0
+    assert view.summary(view.jobs[0])["state"] == "COMPLETED"
 
 
 def test_batched_sacct(fake_slurm: Path) -> None:
@@ -440,3 +444,61 @@ def test_pack_early_failure_logs(slurm_exec: None, wait_slurm: Callable) -> None
     assert sacct.refresh([view], force=True) == 1
     assert view.summary(view.jobs[1])["state"] == "FAILED"
     assert "module: not found" in log_path(view, view.jobs[1], None).read_text()
+
+
+def test_slurm_failure_overrides_job_report(slurm_exec: None, wait_slurm: Callable) -> None:
+    # The Python process succeeds, but the job fails (e.g. another rank failed)
+    job = dawgz.job(
+        lambda: print("ok"), name="a", interpreter='sh -c \'python "$0" "$@"; exit 3\''
+    )()
+    after = echo("after").after(job)
+    scheduler = dawgz.schedule(after, backend="slurm", quiet=True)
+
+    wait_slurm()
+
+    view = store.Workflow.open(scheduler.path)
+    assert view.summary(view.jobs[0])["state"] == "COMPLETED"  # provisional
+    sacct.refresh([view], force=True)
+    assert view.summary(view.jobs[0])["state"] == "FAILED"
+    assert view.summary(view.jobs[1])["state"] == "CANCELLED"
+
+
+def test_any_after_cancelled_dependency(slurm_exec: None, wait_slurm: Callable) -> None:
+    a = fail()
+    b = echo("b").after(a)  # cancelled by Slurm
+    c = echo("c").after(b, status="any")  # runs anyway (afterany)
+    scheduler = dawgz.schedule(c, backend="slurm", quiet=True)
+
+    wait_slurm()
+
+    view = store.Workflow.open(scheduler.path)
+    sacct.refresh([view], force=True)
+    assert [view.summary(j)["state"] for j in view.jobs] == ["FAILED", "CANCELLED", "COMPLETED"]
+
+
+def test_recorded_before_submission(fake_slurm: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A workflow is visible (and cancellable) while it is being submitted
+    monkeypatch.setenv("FAKESLURM_DELAY", "0.3")
+
+    import threading
+
+    done = threading.Event()
+    seen = []
+
+    def watch() -> None:
+        while not done.is_set():
+            rows = store.registry(dawgz.get_dawgz_dir())
+            if rows:
+                view = store.Workflow.open(dawgz.get_dawgz_dir() / rows[0]["uid"])
+                if view is not None:
+                    seen.append(len(view.jobs))
+                    return
+            time.sleep(0.02)
+
+    thread = threading.Thread(target=watch)
+    thread.start()
+    dawgz.schedule(*[echo(i).after(echo(-i)) for i in range(3)], backend="slurm", quiet=True)
+    done.set()
+    thread.join()
+
+    assert seen == [6]

@@ -148,10 +148,13 @@ class SlurmScheduler(Scheduler):
 
         units = self.units(jobs) if self.pack else [[job] for job in jobs]
 
+        # Recorded before, during and after submission: jobs are never untracked
+        self.record()
+        self._recorded = time.monotonic()
+
         try:
             asyncio.run(self._submit_all(units))
         finally:
-            # Also record partial submissions (e.g. interrupted by Ctrl-C)
             self.record()
 
     def units(self, jobs: list[Job]) -> list[list[Job]]:
@@ -210,6 +213,9 @@ class SlurmScheduler(Scheduler):
         else:
             for job, jobid in zip(unit, jobids, strict=True):
                 self.results[job] = jobid
+            if time.monotonic() - getattr(self, "_recorded", 0.0) > 1.0:
+                self._recorded = time.monotonic()
+                self.record()
             return jobids
 
     async def _jobid(self, dep: Job) -> str | BaseException:

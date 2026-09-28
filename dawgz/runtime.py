@@ -88,11 +88,19 @@ class Run:
                 if self.dirty and not self.closed:
                     self.write()
 
+    MAX_BARS = 8
+
     def bar(self, key: str, **fields) -> None:
+        r"""Updates the progress bar `key` (e.g. a line of the output, or a `Progress`)."""
+
         with self.lock:
             bar = self.bars.get(key)
             if bar is None:
                 bar = self.bars[key] = {"desc": key}
+                # Keep the most recently updated bars only
+                while len(self.bars) > self.MAX_BARS:
+                    oldest = min(self.bars, key=lambda k: self.bars[k].get("t", 0))
+                    del self.bars[oldest]
             changed = any(bar.get(k) != v for k, v in fields.items())
             bar.update(fields)
             bar["t"] = time.time()
@@ -143,6 +151,13 @@ ETA = re.compile(r"<([\d:]+)")
 def parse_bar(line: str) -> dict | None:
     r"""Parses a `tqdm` progress line into a progress entry."""
 
+    try:
+        return _parse_bar(line)
+    except (ValueError, OverflowError, ZeroDivisionError, KeyError):
+        return None
+
+
+def _parse_bar(line: str) -> dict | None:
     match = TQDM.search(line)
 
     if match is not None:
@@ -185,6 +200,9 @@ def parse_bar(line: str) -> dict | None:
         if key in entry and entry[key] == int(entry[key]):
             entry[key] = int(entry[key])
 
+    if entry.get("total") == 0:
+        del entry["total"]
+
     return entry
 
 
@@ -198,14 +216,26 @@ def _clock(text: str) -> float | None:
         return None
 
 
-class Cooker:
-    r"""Collapses carriage-return redraws of a byte stream, like a terminal would.
+class Row:
+    __slots__ = ("buf", "written", "redraw", "dirty")
 
-    Regular lines are written through immediately. A line that is being redrawn with
-    carriage returns is written at most once every `interval` seconds, and when it ends.
+    def __init__(self) -> None:
+        self.buf = ""
+        self.written = 0  # characters already written to the log
+        self.redraw = False  # the row has been redrawn with a carriage return
+        self.dirty = False
+
+
+class Cooker:
+    r"""Renders a stream like a terminal would, and writes it compactly.
+
+    Regular lines are written through immediately. Lines redrawn in place, with carriage
+    returns or cursor movements (e.g. nested `tqdm` bars), are written at most once every
+    `interval` seconds, and when they scroll out of reach.
     """
 
-    SPLIT = re.compile(rb"(\r\n|\r|\n)")
+    SPLIT = re.compile(r"(\r\n|\r|\n|\x1b\[\d*A)")
+    MAX_LINE = 1 << 16
 
     def __init__(
         self,
@@ -214,19 +244,25 @@ class Cooker:
         run: Run | None = None,
         interval: float | None = None,
     ) -> None:
+        import codecs
+
         self.out_fd = out_fd
         self.tee_fd = tee_fd
         self.run = run
         self.interval = _env_float("DAWGZ_LOG_INTERVAL", 10.0) if interval is None else interval
-        self.line = bytearray()
-        self.cursor = 0
-        self.written = 0  # bytes of the current line already written
-        self.redraw = False
-        self.dirty = False
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.rows = [Row()]
+        self.r = 0  # cursor row (within `rows`)
+        self.c = 0  # cursor column
+        self.up = 0  # largest cursor movement upwards, rows within reach are kept
+        self.shown = 0  # length of the last snapshot of a multi-row screen
         self.last = 0.0
+        self.closed = False
 
-    def _write(self, data: bytes, fd: int | None = None) -> None:
+    def _write(self, data: str | bytes, fd: int | None = None) -> None:
         fd = self.out_fd if fd is None else fd
+        if isinstance(data, str):
+            data = data.encode("utf-8", errors="replace")
         view = memoryview(data)
         while view:
             try:
@@ -241,85 +277,145 @@ class Cooker:
         if self.tee_fd is not None:
             self._write(data, self.tee_fd)
 
-        for token in self.SPLIT.split(data):
+        for token in self.SPLIT.split(self.decoder.decode(data)):
             if not token:
                 continue
-            elif token in (b"\n", b"\r\n"):
+            elif token in ("\n", "\r\n"):
                 self._newline()
-            elif token == b"\r":
-                self.cursor = 0
-                if not self.redraw:
-                    self.redraw = True
+            elif token == "\r":
+                self.c = 0
+                self.rows[self.r].redraw = True
+            elif token.startswith("\x1b["):
+                n = int(token[2:-1] or "1")
+                self.up = max(self.up, n)
+                self.r = max(self.r - n, 0)
+                self.rows[self.r].redraw = True
             else:
                 self._text(token)
 
-        if self.redraw and self.dirty:
-            self._progress()
-            if time.monotonic() - self.last >= self.interval:
-                self.checkpoint()
-        elif not self.redraw and len(self.line) > self.written:
-            self._write(bytes(self.line[self.written :]))
-            self.written = len(self.line)
+        self._flush()
 
-            # Bound memory for very long lines
-            if len(self.line) > 65536:
-                self.line.clear()
-                self.cursor = 0
-                self.written = 0
-
-    def _text(self, token: bytes) -> None:
-        end = self.cursor + len(token)
-        self.line[self.cursor : end] = token
-        self.cursor = end
-        self.dirty = True
+    def _text(self, token: str) -> None:
+        row = self.rows[self.r]
+        end = min(self.c + len(token), self.MAX_LINE)
+        if self.c < end:
+            buf = row.buf
+            if len(buf) < self.c:
+                buf += " " * (self.c - len(buf))
+            row.buf = buf[: self.c] + token[: end - self.c] + buf[end:]
+        self.c = end
+        row.dirty = True
 
     def _newline(self) -> None:
-        if self.redraw:
-            self._progress()
-            self._write(
-                b"\r" + bytes(self.line) + b"\n" if self.written else bytes(self.line) + b"\n"
-            )
-        else:
-            self._write(bytes(self.line[self.written :]) + b"\n")
+        self.r += 1
+        self.c = 0
+        if self.r == len(self.rows):
+            self.rows.append(Row())
 
-        self.line.clear()
-        self.cursor = 0
-        self.written = 0
-        self.redraw = False
-        self.dirty = False
+        # Rows out of reach of the cursor are final. Redrawn rows are kept one more line,
+        # as programs drawing several bars (e.g. nested tqdm) move up only afterwards.
+        while len(self.rows) > 1 and self.r > max(self.up, int(self.rows[0].redraw)):
+            self._commit(self.rows.pop(0))
+            self.r -= 1
+
+    def _commit(self, row: Row) -> None:
+        self._progress(row, 0)
+
+        if row.redraw:
+            buf = row.buf.rstrip(" ")  # e.g. bars cleared with spaces
+            pad = " " * max(self.shown - len(buf), 0) if self.shown and row.written else ""
+            prefix = "\r" if row.written else ""
+            self._write(prefix + buf + pad + "\n")
+        else:
+            self._write(row.buf[row.written :] + "\n")
+
+        self.shown = 0
+
+    def _flush(self) -> None:
+        if self.up == 0 and len(self.rows) == 1:
+            row = self.rows[0]
+            if row.redraw:
+                if row.dirty:
+                    self._progress(row, 0)
+                    if time.monotonic() - self.last >= self.interval:
+                        self.checkpoint()
+            elif len(row.buf) > row.written:
+                # Plain output is written through
+                self._write(row.buf[row.written :])
+                row.written = len(row.buf)
+                if len(row.buf) >= self.MAX_LINE:  # bound memory for very long lines
+                    row.buf = ""
+                    row.written = 0
+                    self.c = 0
+        else:
+            dirty = False
+            for k, row in enumerate(self.rows):
+                if row.dirty:
+                    self._progress(row, k)
+                    dirty = True
+            if dirty and time.monotonic() - self.last >= self.interval:
+                self.checkpoint()
 
     def checkpoint(self) -> None:
-        r"""Writes the current state of a redrawn line, to be overwritten later."""
+        r"""Writes the current state of redrawn rows, to be overwritten later."""
 
-        if self.redraw and self.dirty:
-            prefix = b"\r" if self.written else b""
-            self._write(prefix + bytes(self.line))
-            self.written = max(len(self.line), 1)
-            self.dirty = False
-            self.last = time.monotonic()
+        rows = [row for row in self.rows if row.buf.strip()]
+        if not rows or not any(row.dirty for row in self.rows):
+            return
 
-    def _progress(self) -> None:
+        base = self.rows[0]
+
+        if len(self.rows) == 1:
+            if not base.redraw:
+                return
+            prefix = "\r" if base.written else ""
+            self._write(prefix + base.buf)
+            base.written = max(len(base.buf), 1)
+        else:
+            # A snapshot of the screen on the first line, e.g. "epoch 3/10 │ 45% batches"
+            snapshot = " │ ".join(row.buf.strip() for row in rows)
+            snapshot += " " * max(self.shown - len(snapshot), 0)
+            prefix = "\r" if base.written else ""
+            self._write(prefix + snapshot)
+            base.written = max(len(snapshot), 1)
+            base.redraw = True
+            self.shown = len(snapshot)
+
+        for row in self.rows:
+            row.dirty = False
+        self.last = time.monotonic()
+
+    def _progress(self, row: Row, k: int) -> None:
         if self.run is None:
             return
 
         try:
-            text = self.line.decode(errors="replace")
-        except Exception:  # pragma: no cover
-            return
-
-        entry = parse_bar(text)
-
-        if entry is not None:
-            desc = entry.pop("desc")
-            self.run.bar(desc, **entry)
+            entry = parse_bar(row.buf)
+            if entry is not None:
+                self.run.bar(f"line{k}", **entry)
+        except Exception:  # never let parsing break the stream
+            pass
 
     def close(self) -> None:
-        if self.redraw:
-            if self.dirty or not self.written:
-                self.checkpoint()
-            self._write(b"\n")
-        elif len(self.line) > self.written:
-            self._write(bytes(self.line[self.written :]))
+        if self.closed:
+            return
+        self.closed = True
+
+        tail = self.decoder.decode(b"", final=True)
+        if tail:
+            self._text(tail)
+
+        rows = self.rows
+        while rows and not rows[-1].buf and not rows[-1].written:
+            rows.pop()
+
+        for k, row in enumerate(rows):
+            last = k == len(rows) - 1
+            if last and not row.redraw and len(rows) == 1:
+                self._progress(row, k)
+                self._write(row.buf[row.written :])  # keep a missing final newline
+            else:
+                self._commit(row)
 
 
 @contextmanager
@@ -349,32 +445,46 @@ def capture(
     os.dup2(w, 2)
     os.close(w)
 
-    cooker = Cooker(
-        saved[0] if out_fd is None else out_fd,
-        tee_fd=saved[0] if tee else None,
-        run=run,
-    )
+    # The cooker owns its descriptors: they stay valid if the thread outlives the job
+    out = os.dup(saved[0] if out_fd is None else out_fd)
+    tee_fd = os.dup(saved[0]) if tee else None
+    cooker = Cooker(out, tee_fd=tee_fd, run=run)
 
     def pump() -> None:
+        broken = False
         while True:
             try:
                 ready, _, _ = select.select([r], [], [], cooker.interval)
-            except (OSError, ValueError):
-                break
-
-            if not ready:
-                cooker.checkpoint()
-                continue
-
-            try:
+                if not ready:
+                    if not broken:
+                        cooker.checkpoint()
+                    continue
                 data = os.read(r, 65536)
-            except OSError:
+            except (OSError, ValueError):
                 break
 
             if not data:
                 break
 
-            cooker.feed(data)
+            try:
+                if broken:
+                    cooker._write(data)
+                else:
+                    cooker.feed(data)
+            except Exception:
+                # Never stop draining the pipe, which would block the job
+                broken = True
+                cooker._write(data)
+
+        try:
+            cooker.close()
+        except Exception:
+            pass
+
+        os.close(r)
+        os.close(out)
+        if tee_fd is not None:
+            os.close(tee_fd)
 
     thread = threading.Thread(target=pump, daemon=True)
     thread.start()
@@ -384,10 +494,10 @@ def capture(
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
     sys.stdout = open(
         1, "w", buffering=1, encoding=encoding, errors="backslashreplace", closefd=False
-    )
+    )  # noqa: SIM115
     sys.stderr = open(
         2, "w", buffering=1, encoding=encoding, errors="backslashreplace", closefd=False
-    )
+    )  # noqa: SIM115
 
     try:
         yield cooker
@@ -400,18 +510,15 @@ def capture(
 
         sys.stdout, sys.stderr = streams
 
+        # Closes the last write ends of the pipe held by this process
         os.dup2(saved[0], 1)
         os.dup2(saved[1], 2)
-
-        # Subprocesses that outlive the job may keep the pipe open
-        thread.join(timeout=5.0)
-        cooker.close()
-
         os.close(saved[0])
         os.close(saved[1])
 
-        if not thread.is_alive():
-            os.close(r)
+        # Processes that outlive the job may keep the pipe open: their output keeps
+        # going to the log, from a daemon thread
+        thread.join(timeout=1.0)
 
 
 # Entry points
@@ -472,6 +579,8 @@ def execute(
         except SystemExit as e:
             if e.code is None or isinstance(e.code, int):
                 code = e.code or 0
+                if not 0 <= code <= 255:
+                    code = 1
             else:
                 code = 1
                 print(e.code, file=sys.stderr, flush=True)
