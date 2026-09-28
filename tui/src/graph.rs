@@ -176,8 +176,8 @@ pub const GAP: u16 = 8;
 
 #[derive(Clone, Debug)]
 pub struct Placed {
-    pub x: u16,
-    pub y: u16,
+    pub x: u32,
+    pub y: u32,
     pub layer: usize,
 }
 
@@ -191,11 +191,11 @@ pub struct Dag {
     /// Positions of the (real) nodes.
     pub nodes: Vec<Placed>,
     /// Line cells: (x, y) -> (direction bits, edges passing through the cell).
-    pub lines: HashMap<(u16, u16), (u8, Vec<(usize, usize)>)>,
+    pub lines: HashMap<(u32, u32), (u8, Vec<(usize, usize)>)>,
     /// Arrow heads, in front of children.
-    pub arrows: Vec<(u16, u16, (usize, usize))>,
-    pub width: u16,
-    pub height: u16,
+    pub arrows: Vec<(u32, u32, (usize, usize))>,
+    pub width: u32,
+    pub height: u32,
     pub layers: Vec<Vec<usize>>,
     pub node_w: u16,
 }
@@ -214,7 +214,9 @@ impl Dag {
         layer.into_iter().max().map(|d| d + 1).unwrap_or(0)
     }
 
-    pub fn layout_with(parents: &[Vec<usize>], node_w: u16) -> Dag {
+    pub fn layout_with(parents: &[Vec<usize>], node_w16: u16) -> Dag {
+        let node_w = node_w16 as u32;
+        let (node_h, gap) = (NODE_H as u32, GAP as u32);
         let n = parents.len();
         if n == 0 {
             return Dag::default();
@@ -311,14 +313,16 @@ impl Dag {
                     .collect();
                 keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
                 layers[l] = keyed.into_iter().map(|(_, k)| k).collect();
-                refresh(&layers, &mut pos);
+                for (i, &k) in layers[l].iter().enumerate() {
+                    pos[k] = i as f64;
+                }
             }
         }
 
         // Coordinates
-        let height_of = |k: usize| if vs[k].real.is_some() { NODE_H } else { 1 };
-        let center = |k: usize, y: u16| if vs[k].real.is_some() { y + 1 } else { y };
-        let mut ys = vec![0u16; vs.len()];
+        let height_of = |k: usize| if vs[k].real.is_some() { node_h } else { 1 };
+        let center = |k: usize, y: u32| if vs[k].real.is_some() { y + 1 } else { y };
+        let mut ys = vec![0u32; vs.len()];
 
         for l in 0..depth {
             let mut bottom: i32 = -1;
@@ -332,13 +336,13 @@ impl Dag {
                     let offset = if vs[k].real.is_some() { 1.0 } else { 0.0 };
                     (c - offset).round().max(0.0) as i32
                 };
-                let y = desired.max(bottom + 1) as u16;
+                let y = desired.max(bottom + 1) as u32;
                 ys[k] = y;
                 bottom = (y + height_of(k)) as i32;
             }
         }
 
-        let x_of = |l: usize| l as u16 * (node_w + GAP);
+        let x_of = |l: usize| l as u32 * (node_w + gap);
         let mut dag = Dag {
             nodes: vec![
                 Placed {
@@ -349,7 +353,7 @@ impl Dag {
                 n
             ],
             layers: vec![Vec::new(); depth],
-            node_w,
+            node_w: node_w16,
             ..Dag::default()
         };
 
@@ -373,10 +377,10 @@ impl Dag {
                 .copied()
                 .filter(|&k| !succs[k].is_empty())
                 .collect();
-            let slots = (GAP - 3).max(1) as usize;
+            let slots = (gap - 3).max(1) as usize;
 
             for (rank, &p) in parents_in_layer.iter().enumerate() {
-                let bus = x_of(l) + node_w + 1 + (rank % slots) as u16;
+                let bus = x_of(l) + node_w + 1 + (rank % slots) as u32;
                 let py = center(p, ys[p]);
                 let px = if vs[p].real.is_some() {
                     x_of(l) + node_w
@@ -415,7 +419,7 @@ impl Dag {
         dag
     }
 
-    fn add(&mut self, x: u16, y: u16, bits: u8, edge: (usize, usize)) {
+    fn add(&mut self, x: u32, y: u32, bits: u8, edge: (usize, usize)) {
         let cell = self.lines.entry((x, y)).or_insert((0, Vec::new()));
         cell.0 |= bits;
         if !cell.1.contains(&edge) {
@@ -423,7 +427,7 @@ impl Dag {
         }
     }
 
-    fn hline(&mut self, a: u16, b: u16, y: u16, edge: (usize, usize)) {
+    fn hline(&mut self, a: u32, b: u32, y: u32, edge: (usize, usize)) {
         let (a, b) = (a.min(b), a.max(b));
         for x in a..=b {
             let mut bits = 0;
@@ -437,7 +441,7 @@ impl Dag {
         }
     }
 
-    fn vline(&mut self, x: u16, a: u16, b: u16, edge: (usize, usize)) {
+    fn vline(&mut self, x: u32, a: u32, b: u32, edge: (usize, usize)) {
         if a == b {
             return;
         }
@@ -532,11 +536,25 @@ mod tests {
         for layer in &dag.layers {
             for w in layer.windows(2) {
                 let (a, b) = (&dag.nodes[w[0]], &dag.nodes[w[1]]);
-                assert!(a.y + NODE_H <= b.y || b.y + NODE_H <= a.y);
+                let h = NODE_H as u32;
+                assert!(a.y + h <= b.y || b.y + h <= a.y);
             }
         }
         assert!(!dag.lines.is_empty());
         assert_eq!(dag.neighbor(0, 1, 0).map(|v| dag.nodes[v].layer), Some(1));
+    }
+
+    #[test]
+    fn long_chains_are_fast() {
+        let n = 20_000;
+        let parents: Vec<Vec<usize>> = (0..n)
+            .map(|v| if v == 0 { vec![] } else { vec![v - 1] })
+            .collect();
+        let start = std::time::Instant::now();
+        let dag = Dag::layout_with(&parents, NODE_W);
+        assert!(start.elapsed().as_secs_f64() < 2.0);
+        assert_eq!(dag.nodes[n - 1].layer, n - 1);
+        assert!(dag.width > u16::MAX as u32); // no overflow
     }
 
     #[test]

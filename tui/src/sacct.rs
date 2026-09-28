@@ -253,7 +253,7 @@ pub fn queue() -> Result<Vec<QueueJob>, String> {
         cmd.args(["-u", &user]);
     }
     let out = cmd
-        .args(["-h", "-o", "%i|%P|%j|%T|%M|%l|%D|%R"])
+        .args(["-h", "-o", "%i\x1f%P\x1f%j\x1f%T\x1f%M\x1f%l\x1f%D\x1f%R"])
         .output()
         .map_err(|e| format!("squeue: {e}"))?;
     if !out.status.success() {
@@ -265,7 +265,12 @@ pub fn queue() -> Result<Vec<QueueJob>, String> {
 pub fn parse_queue(text: &str) -> Vec<QueueJob> {
     text.lines()
         .filter_map(|line| {
-            let f: Vec<&str> = line.split('|').collect();
+            // The unit separator cannot appear in job names, unlike `|`
+            let f: Vec<&str> = if line.contains('\x1f') {
+                line.split('\x1f').collect()
+            } else {
+                line.split('|').collect()
+            };
             (f.len() >= 8).then(|| QueueJob {
                 id: f[0].trim().to_string(),
                 partition: f[1].trim().to_string(),

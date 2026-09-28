@@ -420,11 +420,12 @@ mod tests {
         assert_eq!(w.summary(7).state, "CANCELLED");
         assert_eq!(w.totals.total(), 11);
 
-        // Only jobs that may have started are refreshed
+        // Jobs confirmed by Slurm and jobs waiting for dependencies are not refreshed.
+        // States reported by jobs (101_0, 101_1) and inferred ones (102) are confirmed.
         let stale = w.stale(0.0);
-        assert!(stale.contains(&"101_3".to_string()));
-        assert!(stale.contains(&"101_4".to_string()));
-        assert!(!stale.contains(&"102".to_string()));
+        for id in ["101_0", "101_1", "101_3", "101_4", "102"] {
+            assert!(stale.contains(&id.to_string()), "{id}");
+        }
         assert!(!stale.contains(&"100".to_string()));
         let _ = fs::remove_dir_all(dir);
     }

@@ -23,6 +23,9 @@ use unicode_width::UnicodeWidthStr;
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let t = app.theme.clone();
+
+    // Mouse hit areas are those of this frame only
+    app.areas = crate::app::Areas::default();
     f.buffer_mut().set_style(area, t.base());
 
     let [header, body, footer] = Layout::vertical([
@@ -61,6 +64,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     app.areas.sidebar = sidebar;
     app.areas.main = main;
+}
+
+/// Tail of a log, cached by modification time and size (the detail pane is drawn
+/// every 100 ms, and logs may live on a shared file system).
+fn cached_tail(app: &App, path: &std::path::Path) -> Option<logs::Log> {
+    let meta = std::fs::metadata(path).ok()?;
+    let (mtime, len) = (meta.modified().ok(), meta.len());
+    let mut cache = app.log_cache.borrow_mut();
+    if let Some((p, m, l, log)) = cache.as_ref() {
+        if p == path && *m == mtime && *l == len {
+            return Some(log.clone());
+        }
+    }
+    let log = logs::read_tail(path, 1 << 16)?;
+    *cache = Some((path.to_path_buf(), mtime, len, log.clone()));
+    Some(log)
 }
 
 fn spans_width(spans: &[Span]) -> usize {
@@ -1713,7 +1732,7 @@ fn draw_entry(
 
     if bottom.height >= 2 {
         let path = w.log_path(job, i);
-        let log = logs::read(&path);
+        let log = cached_tail(app, &path);
         let (title, lines): (String, Vec<String>) = match &log {
             Some(l) => (
                 format!(" logs · {} ", widgets::size(l.size)),
@@ -1810,16 +1829,20 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         .clamp(18, 30);
     if app.dag.node_w != fit {
         app.dag = crate::graph::Dag::layout_with(&app.parents, fit);
+        if let Some(key) = app.dag_key.as_mut() {
+            key.2 = fit;
+        }
     }
 
     let Some(w) = app.current() else { return };
     let dag = &app.dag;
-    let node_w = dag.node_w;
+    let node_w = dag.node_w as u32;
+    let node_h = NODE_H as u32;
 
     // Center small graphs
     let (ox, oy) = (
-        canvas.width.saturating_sub(dag.width) / 2,
-        canvas.height.saturating_sub(dag.height) / 3,
+        (canvas.width as u32).saturating_sub(dag.width) as u16 / 2,
+        (canvas.height as u32).saturating_sub(dag.height) as u16 / 3,
     );
     let canvas = Rect {
         x: canvas.x + ox,
@@ -1831,32 +1854,28 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     let node = &dag.nodes[sel];
 
     // Scroll to keep the selection visible
+    let (cw, ch) = (canvas.width as u32, canvas.height as u32);
     let (mut sx, mut sy) = app.graph_scroll;
     if node.x < sx {
         sx = node.x.saturating_sub(2);
     }
-    if node.x + node_w + 2 > sx + canvas.width {
-        sx = (node.x + node_w + 2).saturating_sub(canvas.width);
+    if node.x + node_w + 2 > sx + cw {
+        sx = (node.x + node_w + 2).saturating_sub(cw);
     }
     if node.y < sy {
         sy = node.y.saturating_sub(1);
     }
-    if node.y + NODE_H + 1 > sy + canvas.height {
-        sy = (node.y + NODE_H + 1).saturating_sub(canvas.height);
+    if node.y + node_h + 1 > sy + ch {
+        sy = (node.y + node_h + 1).saturating_sub(ch);
     }
-    let (sx, sy) = if dag.width <= canvas.width {
-        (0, sy)
-    } else {
-        (sx, sy)
-    };
+    let (sx, sy) = if dag.width <= cw { (0, sy) } else { (sx, sy) };
 
     let buf = f.buffer_mut();
-    let place = |x: u16, y: u16| -> Option<(u16, u16)> {
-        if x < sx || y < sy {
+    let place = |x: u32, y: u32| -> Option<(u16, u16)> {
+        if x < sx || y < sy || x - sx >= cw || y - sy >= ch {
             return None;
         }
-        let (px, py) = (canvas.x + x - sx, canvas.y + y - sy);
-        (px < canvas.x + canvas.width && py < canvas.y + canvas.height).then_some((px, py))
+        Some((canvas.x + (x - sx) as u16, canvas.y + (y - sy) as u16))
     };
 
     // Edges
@@ -1923,7 +1942,7 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             ('╭', '╮', '╰', '╯', '─', '│')
         };
 
-        for dy in 0..NODE_H {
+        for dy in 0..node_h {
             for dx in 0..node_w {
                 let Some((px, py)) = place(p.x + dx, p.y + dy) else {
                     continue;
@@ -1931,10 +1950,10 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
                 let ch = match (dx, dy) {
                     (0, 0) => tl,
                     (x, 0) if x == node_w - 1 => tr,
-                    (0, y) if y == NODE_H - 1 => bl,
-                    (x, y) if x == node_w - 1 && y == NODE_H - 1 => br,
+                    (0, y) if y == node_h - 1 => bl,
+                    (x, y) if x == node_w - 1 && y == node_h - 1 => br,
                     (_, 0) => h,
-                    (_, y) if y == NODE_H - 1 => h,
+                    (_, y) if y == node_h - 1 => h,
                     (0, _) => v,
                     (x, _) if x == node_w - 1 => v,
                     _ => ' ',
@@ -1954,7 +1973,7 @@ fn draw_graph(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
                 job.index.to_string()
             }
         );
-        let lx = p.x + node_w - 1 - label.width() as u16;
+        let lx = p.x + node_w - 1 - label.width() as u32;
         put(
             buf,
             &place,
@@ -2074,9 +2093,9 @@ fn draw_node_detail(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
 
 fn put(
     buf: &mut Buffer,
-    place: &dyn Fn(u16, u16) -> Option<(u16, u16)>,
-    x: u16,
-    y: u16,
+    place: &dyn Fn(u32, u32) -> Option<(u16, u16)>,
+    x: u32,
+    y: u32,
     text: &str,
     style: Style,
 ) {
@@ -2085,21 +2104,21 @@ fn put(
         if let Some((px, py)) = place(x + dx, y) {
             buf[(px, py)].set_char(c).set_style(style);
         }
-        dx += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u16;
+        dx += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u32;
     }
 }
 
 fn put_spans(
     buf: &mut Buffer,
-    place: &dyn Fn(u16, u16) -> Option<(u16, u16)>,
-    x: u16,
-    y: u16,
+    place: &dyn Fn(u32, u32) -> Option<(u16, u16)>,
+    x: u32,
+    y: u32,
     spans: &[Span],
 ) {
     let mut dx = 0;
     for s in spans {
         put(buf, place, x + dx, y, &s.content, s.style);
-        dx += s.content.width() as u16;
+        dx += s.content.width() as u32;
     }
 }
 

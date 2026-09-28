@@ -69,8 +69,10 @@ pub enum Popup {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    /// Workflows are identified by directory and ID, as the list may change meanwhile
     Cancel {
-        workflow: usize,
+        dir: PathBuf,
+        uid: String,
         job: Option<usize>,
         i: Option<usize>,
     },
@@ -162,7 +164,7 @@ pub struct App {
     pub gutter: Vec<Vec<[char; 2]>>,
     pub dag: Dag,
     pub graph_sel: usize,
-    pub graph_scroll: (u16, u16),
+    pub graph_scroll: (u32, u32),
     pub rows: Vec<Row>,
     pub row_sel: usize,
     pub expanded: HashSet<(String, usize)>,
@@ -185,6 +187,8 @@ pub struct App {
     pub sacct_last: f64,
     pub sacct_calls: usize,
     pub queue: Queue,
+    pub dag_key: Option<(String, Vec<Vec<usize>>, u16)>,
+    pub log_cache: std::cell::RefCell<Option<(PathBuf, Option<SystemTime>, u64, logs::Log)>>,
     last_forced: f64,
     known: HashMap<(String, usize), Cat>,
     finished: HashSet<String>,
@@ -250,6 +254,8 @@ impl App {
             sacct_last: 0.0,
             sacct_calls: 0,
             queue: Queue::default(),
+            dag_key: None,
+            log_cache: std::cell::RefCell::new(None),
             last_forced: 0.0,
             known: HashMap::new(),
             finished: HashSet::new(),
@@ -470,7 +476,12 @@ impl App {
         } else {
             self.dag.node_w
         };
-        self.dag = Dag::layout_with(&parents, node_w);
+        // The layout only depends on the structure of the workflow and the width
+        let key = (uid.clone(), parents.clone(), node_w);
+        if self.dag_key.as_ref() != Some(&key) {
+            self.dag = Dag::layout_with(&parents, node_w);
+            self.dag_key = Some(key);
+        }
         self.groups = groups;
         self.parents = parents;
         self.rows = rows;
@@ -1080,6 +1091,14 @@ impl App {
                     .flatten()
                 {
                     self.graph_sel = v;
+                    // Keep the jobs table (and actions like cancel) on the same node
+                    if let Some(k) = self
+                        .rows
+                        .iter()
+                        .position(|r| matches!(r, Row::Node { group, .. } if *group == v))
+                    {
+                        self.row_sel = k;
+                    }
                 } else if dx < 0 {
                     self.focus = Focus::Workflows;
                 }
@@ -1297,7 +1316,8 @@ impl App {
         self.popup = Some(Popup::Confirm {
             message: format!("Cancel {what}?"),
             action: Action::Cancel {
-                workflow: wk,
+                dir: w.dir.clone(),
+                uid: w.uid().to_string(),
                 job,
                 i,
             },
@@ -1306,11 +1326,16 @@ impl App {
 
     fn execute(&mut self, action: Action) {
         match action {
-            Action::Cancel { workflow, job, i } => {
-                if let Some(w) = self.workflows.get_mut(workflow) {
-                    let message = w.cancel(job, i);
-                    self.flash(message);
-                }
+            Action::Cancel { dir, uid, job, i } => {
+                let target = self
+                    .workflows
+                    .iter_mut()
+                    .find(|w| w.dir == dir && w.uid() == uid);
+                let message = match target {
+                    Some(w) => w.cancel(job, i),
+                    None => "the workflow is not listed anymore".to_string(),
+                };
+                self.flash(message);
                 self.after_reload();
             }
             Action::Scancel { id } => {

@@ -17,6 +17,7 @@ pub struct Meta {
     pub host: String,
     pub user: String,
     pub pid: Option<i64>,
+    pub pid_start: Option<u64>,
     pub jobs: Vec<JobMeta>,
     pub sources: Vec<String>,
 }

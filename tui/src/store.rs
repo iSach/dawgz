@@ -25,10 +25,25 @@ pub fn hostname() -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
-pub fn pid_alive(pid: i64) -> bool {
+/// Start time of a process (Linux), to detect reused PIDs.
+pub fn pid_start(pid: i64) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+pub fn pid_alive(pid: i64, start: Option<u64>) -> bool {
     // SAFETY: signal 0 only checks for the existence of the process.
     let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let exists = r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    match start {
+        Some(start) if exists => pid_start(pid).is_none_or(|s| s == start),
+        _ => exists,
+    }
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
@@ -290,7 +305,7 @@ impl Workflow {
             return;
         }
         let Some(pid) = self.meta.pid else { return };
-        if self.meta.host != hostname() || pid_alive(pid) {
+        if self.meta.host != hostname() || pid_alive(pid, self.meta.pid_start) {
             return;
         }
         fn mark(e: &mut Entry) {
@@ -320,13 +335,13 @@ impl Workflow {
         let cached = match i {
             None => parent.clone(),
             Some(i) => match parent.tasks.get(&i.to_string()) {
-                Some(t) => t.clone(),
-                None if parent.state.as_deref().map(is_terminal).unwrap_or(false) => Entry {
+                Some(t) if t.state.is_some() => t.clone(),
+                _ if parent.state.as_deref().map(is_terminal).unwrap_or(false) => Entry {
                     state: parent.state.clone(),
                     reason: parent.reason.clone(),
                     ..Entry::default()
                 },
-                None => Entry::default(),
+                _ => Entry::default(),
             },
         };
 
@@ -494,17 +509,41 @@ impl Workflow {
             .iter()
             .filter(|j| j.jobid.is_some())
             .filter(|j| {
-                !matches!(
-                    self.inferred.get(&j.index),
-                    Some(Readiness::Wait) | Some(Readiness::Never)
-                )
+                // Jobs waiting for unfinished dependencies are pending
+                let waiting = self.inferred.get(&j.index) == Some(&Readiness::Wait);
+                !(waiting && self.elements(j).iter().all(|e| e.state() == "PENDING"))
             })
             .filter(|j| {
-                let s = &self.summaries[j.index];
-                s.counts.finished() < s.total
+                // States reported by jobs are provisional until Slurm confirms them
+                !self
+                    .cached(j)
+                    .iter()
+                    .all(|e| e.state.as_deref().is_some_and(is_terminal))
             })
             .filter_map(|j| j.jobid.clone())
             .collect()
+    }
+
+    /// Entries of `state.json` only (without the reports of jobs).
+    pub fn cached(&self, job: &JobMeta) -> Vec<Entry> {
+        let parent = self
+            .cache
+            .jobs
+            .get(&job.index.to_string())
+            .cloned()
+            .unwrap_or_default();
+        match job.array {
+            None => vec![parent],
+            Some(n) => (0..n)
+                .map(|i| match parent.tasks.get(&i.to_string()) {
+                    Some(t) if t.state.is_some() => t.clone(),
+                    _ => Entry {
+                        state: parent.state.clone(),
+                        ..Entry::default()
+                    },
+                })
+                .collect(),
+        }
     }
 
     /// Merges fresh Slurm entries (keyed by job ID) into `state.json`.
@@ -620,7 +659,7 @@ impl Workflow {
             let Some(pid) = self.meta.pid else {
                 return "nothing to cancel".into();
             };
-            if self.cache.finished || !pid_alive(pid) {
+            if self.cache.finished || !pid_alive(pid, self.meta.pid_start) {
                 return "nothing to cancel".into();
             }
             if self.meta.host != hostname() {
@@ -666,7 +705,8 @@ pub fn readiness(job: &JobMeta, outcomes: &HashMap<usize, Option<&'static str>>)
         .iter()
         .map(|(dep, status)| match outcomes.get(dep).copied().flatten() {
             None => None,
-            Some("cancelled") => Some(false),
+            // Slurm: afterany and afternotok are satisfied by cancelled dependencies
+            Some("cancelled") => Some(status == "any" || status == "failure"),
             Some(outcome) => Some(status == "any" || status == outcome),
         })
         .collect();

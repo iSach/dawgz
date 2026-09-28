@@ -8,6 +8,7 @@ use std::path::Path;
 
 const MAX_BYTES: u64 = 4 << 20;
 
+#[derive(Clone)]
 pub struct Log {
     pub lines: Vec<String>,
     pub size: u64,
@@ -16,9 +17,14 @@ pub struct Log {
 
 /// Reads the end of a log (at most 4 MiB), rendered as a terminal would.
 pub fn read(path: &Path) -> Option<Log> {
+    read_tail(path, MAX_BYTES)
+}
+
+/// Reads at most the last `max_bytes` of a log.
+pub fn read_tail(path: &Path, max_bytes: u64) -> Option<Log> {
     let mut f = File::open(path).ok()?;
     let size = f.metadata().ok()?.len();
-    let start = size.saturating_sub(MAX_BYTES);
+    let start = size.saturating_sub(max_bytes);
     f.seek(SeekFrom::Start(start)).ok()?;
     let mut data = Vec::with_capacity((size - start) as usize);
     f.read_to_end(&mut data).ok()?;
