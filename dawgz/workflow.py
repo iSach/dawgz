@@ -3,11 +3,11 @@ r"""Workflow graph components"""
 from __future__ import annotations
 
 import inspect
+import itertools
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from functools import partial
 from pathlib import Path
-from rich.pretty import pretty_repr
 from textwrap import dedent, indent
 from typing import (
     Any,
@@ -15,7 +15,10 @@ from typing import (
     TypeVar,
 )
 
-from .utils import as_scalar, pickle
+from .utils import as_scalar, pretty
+
+# Creation order, used to break ties when ordering jobs
+COUNTER = itertools.count()
 
 
 class Node:
@@ -33,8 +36,8 @@ class Node:
         node.add_child(self, edge)
 
     def rm_child(self, node: Node) -> None:
-        del self.children[node]
-        del node.parents[self]
+        self.children.pop(node, None)
+        node.parents.pop(self, None)
 
     def rm_parent(self, node: Node) -> None:
         node.rm_child(self)
@@ -54,36 +57,38 @@ class Job(Node):
         interpreter: str | Path = "python",
         env: list[str] | None = None,
         settings: dict[str, int | float | bool | str] | None = None,
+        source: str | None = None,
     ) -> None:
         super().__init__()
+
+        self.seq = next(COUNTER)
 
         if fun is None:
             self.pkl = None
         else:
+            import cloudpickle
+
             inspect.signature(fun).bind(*args, **kwargs)
-            self.pkl = pickle.dumps(partial(fun, *args, **kwargs))
+            self.pkl = cloudpickle.dumps(partial(fun, *args, **kwargs))
 
         # Name
         if name is None:
             name = getattr(fun, "__name__", None)
 
-        assert isinstance(name, str) and name.replace("_", "").isalnum(), (
-            f"function name can only contain underscore and alphanumeric characters, got '{name}'"
-        )
+        if not (isinstance(name, str) and name.replace("_", "").isalnum()):
+            raise ValueError(
+                f"job names can only contain underscores and alphanumeric characters, got '{name}'"
+            )
 
         self.name = name
 
         # Input
-        def prepr(x: object) -> str:
-            return pretty_repr(x, indent_size=2).strip("\n")
-
-        self.args_repr = [prepr(a) for a in args] + [f"{k}=" + prepr(v) for k, v in kwargs.items()]
+        self.args_repr = [pretty(a) for a in args] + [
+            f"{k}=" + pretty(v) for k, v in kwargs.items()
+        ]
 
         # Source
-        try:
-            self.source = dedent(inspect.getsource(fun).strip("\n"))
-        except TypeError:
-            self.source = ""
+        self.source = get_source(fun) if source is None else source
 
         # Settings
         self.shell = str(shell)
@@ -123,13 +128,33 @@ class Job(Node):
         state.pop("pkl", None)
         return state
 
+    def __setstate__(self, state: dict) -> None:
+        state.setdefault("seq", 0)
+        self.__dict__.update(state)
+
+    def __rshift__(self, other: Job | Iterable[Job]) -> Job | list[Job]:
+        r"""Declares that `other` runs after this job (`a >> b` is `b.after(a)`)."""
+
+        if isinstance(other, Job):
+            return other.after(self)
+
+        others = list(other)
+        for job in others:
+            job.after(self)
+        return others
+
+    def __rrshift__(self, other: Iterable[Job]) -> Job:
+        r"""Declares that this job runs after all jobs in `other` (`[a, b] >> c`)."""
+
+        return self.after(*other)
+
     def mark(self, status: Literal["success", "failure", "cancelled", "pending"]) -> Job:
         r"""Sets the completion status of a job.
 
         Arguments:
             status: The completion status. The default status is `"pending"`.
         """
-        assert status in ["success", "failure", "cancelled", "pending"]
+        _check("status", status, ("success", "failure", "cancelled", "pending"))
         self.status = status
         return self
 
@@ -144,7 +169,10 @@ class Job(Node):
             deps: A set of job dependencies.
             status: The desired dependency status.
         """
-        assert status in ["success", "failure", "any"]
+        _check("status", status, ("success", "failure", "any"))
+        for dep in deps:
+            if not isinstance(dep, Job):
+                raise TypeError(f"dependencies should be jobs, got '{type(dep).__name__}'")
         for dep in deps:
             self.add_parent(dep, status)
         return self
@@ -159,7 +187,7 @@ class Job(Node):
         Arguments:
             mode: The dependency waiting mode. The default mode is `"all"`.
         """
-        assert mode in ["all", "any"]
+        _check("mode", mode, ("all", "any"))
         self.wait_mode = mode
         return self
 
@@ -171,8 +199,10 @@ class Job(Node):
             return "ready"
         elif self.wait_mode == "any" and self.satisfied:
             return "ready"
-        elif self.wait_mode == "any" and not self.dependencies:
+        elif self.wait_mode == "any" and not self.dependencies and self.unsatisfied:
             return "never"
+        elif not self.dependencies:
+            return "ready"
         else:
             return "wait"
 
@@ -182,8 +212,12 @@ class JobArray(Job):
         self.array = jobs
         self.throttle = throttle
 
-        assert len(self.array) >= 1, "array should contain at least one job"
-        assert len(self.array) == len(set(self.array)), "array should not contain duplicates"
+        if len(self.array) < 1:
+            raise ValueError("an array should contain at least one job")
+        if len(self.array) != len(set(self.array)):
+            raise ValueError("an array should not contain duplicates")
+        if throttle is not None and (not isinstance(throttle, int) or throttle < 1):
+            raise ValueError(f"throttle should be a positive integer, got {throttle!r}")
 
         if name is None:
             names = set(job.name for job in self.array)
@@ -202,14 +236,15 @@ class JobArray(Job):
         )
 
         for job in self.array:
-            assert not job.parents, "jobs in an array should not have dependencies"
-            assert not job.children, "jobs in an array should not have dependents"
+            if job.parents:
+                raise ValueError("jobs in an array should not have dependencies")
+            if job.children:
+                raise ValueError("jobs in an array should not have dependents")
 
         for key in ("shell", "interpreter", "env", "settings"):
             for job in self.array:
-                assert getattr(job, key) == getattr(self, key), (
-                    f"all jobs in an array should have the same {key}"
-                )
+                if getattr(job, key) != getattr(self, key):
+                    raise ValueError(f"all jobs in an array should have the same {key}")
 
     def __len__(self) -> int:
         return len(self.array)
@@ -227,6 +262,18 @@ class JobArray(Job):
             range = f"0-{len(self) - 1}%{self.throttle}"
 
         return f"{self.name}[{range}]"
+
+
+def get_source(fun: Callable | None) -> str:
+    try:
+        return dedent(inspect.getsource(fun).strip("\n"))
+    except (TypeError, OSError):
+        return ""
+
+
+def _check(name: str, value: str, choices: tuple[str, ...]) -> None:
+    if value not in choices:
+        raise ValueError(f"{name} should be one of {', '.join(map(repr, choices))}, got {value!r}")
 
 
 N = TypeVar("N", bound=Node)
@@ -284,6 +331,34 @@ def cycles(*nodes: Node, backward: bool = False) -> Iterator[list[Node]]:
         path.append(node)
         pathset.add(node)
         visited.add(node)
+
+
+def topological(*jobs: Job) -> list[Job]:
+    r"""Orders jobs and their dependencies such that dependencies come first.
+
+    Ties are broken by creation order, which makes the order deterministic and intuitive.
+    """
+
+    import heapq
+
+    nodes = list(dfs(*jobs, backward=True))
+    indegree = {node: len(node.parents) for node in nodes}
+    heap = [(node.seq, i, node) for i, node in enumerate(nodes) if indegree[node] == 0]
+    heapq.heapify(heap)
+    rank = {node: i for i, node in enumerate(nodes)}
+    order = []
+
+    while heap:
+        *_, node = heapq.heappop(heap)
+        order.append(node)
+
+        for child in node.children:
+            if child in indegree:
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    heapq.heappush(heap, (child.seq, rank[child], child))
+
+    return order
 
 
 def prune(*jobs: Job) -> list[Job]:

@@ -3,25 +3,24 @@ r"""Slurm scheduling backend"""
 from __future__ import annotations
 
 import asyncio
-import rich.box
-import rich.console
-import rich.syntax
-import rich.table
-import subprocess
+import os
+import shlex
 import time
 
 from pathlib import Path
 
 from .core import (
-    ANSITheme,
     JobNeverSatisfiedError,
     JobSubmissionError,
     Scheduler,
 )
+from .. import sacct, store
+from ..runtime import runner
+from ..utils import bytes_dump, trace
 from ..workflow import Job, JobArray
 
-SACCT_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
-SACCT_TTL: float = 5.0  # seconds
+# Most clusters limit arrays to 1001 tasks (MaxArraySize)
+MAX_PACK = 1000
 
 
 class SlurmScheduler(Scheduler):
@@ -31,6 +30,10 @@ class SlurmScheduler(Scheduler):
     according to the job settings. Most settings (e.g. `account`, `export`, `partition`)
     are passed directly to `sbatch`. A few settings (e.g. `cpus`, `gpus`, `ram`) are
     translated into their `sbatch` equivalents.
+
+    Independent jobs are submitted concurrently (at most `concurrency` `sbatch` calls at
+    a time). Jobs whose dependencies can never be satisfied are cancelled by Slurm
+    (`--kill-on-invalid-dep=yes`) instead of pending forever.
     """
 
     backend: str = "slurm"
@@ -45,119 +48,306 @@ class SlurmScheduler(Scheduler):
         "timeout": "time",
     }
 
-    @staticmethod
-    def sacct(jobid: str) -> dict[str, str]:
-        now = time.monotonic()
-        then, states = SACCT_CACHE.get(jobid, (float("-inf"), None))
+    def __init__(
+        self, name: str, concurrency: int | None = None, pack: bool | None = None
+    ) -> None:
+        r"""
+        Arguments:
+            name: The name of the workflow.
+            concurrency: The maximum number of simultaneous `sbatch` calls. If `None`,
+                use the `DAWGZ_SBATCH_CONCURRENCY` environment variable or 16.
+            pack: Whether to submit independent jobs with identical settings and
+                dependencies as a single job array (one task per job). If `None`, use
+                the `DAWGZ_PACK` environment variable or `True`.
+        """
 
-        if now < then + SACCT_TTL:
-            return states
+        super().__init__(name=name)
 
-        text = subprocess.run(
-            ["sacct", "-j", jobid, "-o", "JobID,State", "-n", "-P", "-X"],
-            capture_output=True,
-            check=True,
-            text=True,
-        ).stdout.strip("\n")
+        if concurrency is None:
+            concurrency = int(os.environ.get("DAWGZ_SBATCH_CONCURRENCY", 16))
 
-        states = dict(line.split("|") for line in text.splitlines())
+        if pack is None:
+            pack = os.environ.get("DAWGZ_PACK", "1") not in ("0", "false", "no")
 
-        SACCT_CACHE[jobid] = (now, states)
+        self.concurrency = max(concurrency, 1)
+        self.pack = pack
+        self.scripts: dict[str, str] = {}
 
-        return states
+    def extra(self, job: Job) -> dict:
+        script = getattr(self, "scripts", {}).get(self.tag(job))
+        if script is None:
+            return {}
+        k = (
+            self.results.get(job, "").rpartition("_")[2]
+            if isinstance(self.results.get(job), str)
+            else ""
+        )
+        return {"script": script, "stdout": script.replace(".sh", f"_{k}.out")}
+
+    # Records
+
+    def jobid(self, job: Job) -> str | None:
+        result = self.results.get(job)
+        return result if isinstance(result, str) else None
+
+    def snapshot(self) -> dict:
+        state = super().snapshot()
+        now = time.time()
+
+        for job, jobid in self.results.items():
+            if job in self.order and isinstance(jobid, str):
+                entry = {"state": "PENDING", "submit": now}
+                if isinstance(job, JobArray):
+                    entry["tasks"] = {}
+                state["jobs"][str(self.order[job])] = entry
+
+        state["source"] = "sbatch"
+
+        return state
+
+    def error_state(self, trace: str) -> str:
+        return "CANCELLED" if "JobNeverSatisfiedError" in trace else "FAILED"
 
     def state(self, job: Job, i: int | None = None) -> str:
-        if job in self.traces:
-            return "CANCELLED"
+        if job not in self.order:
+            return "UNKNOWN"
 
-        jobid = self.results[job]
-        table = self.sacct(jobid)
+        view = store.Workflow.open(self.path)
+        sacct.refresh([view])
 
-        if isinstance(job, JobArray):
-            if i is None:
-                return ",".join(sorted(set(table.values())))
-            else:
-                return table.get(f"{jobid}_{i}", "PENDING")
-        else:
-            return table.get(jobid, "UNKNOWN")
+        entry = view.jobs[self.order[job]]
 
-    def settings(self, job: Job, i: int | None = None) -> rich.syntax.Syntax | None:
-        tag = self.tag(job)
-        shfile = self.path / f"{tag}.sh"
+        if i is not None:
+            return view.entry(entry, i % entry["array"] if entry.get("array") else None)["state"]
+
+        return view.summary(entry)["state"]
+
+    def settings(self, job: Job, i: int | None = None) -> str | None:
+        shfile = self.path / getattr(self, "scripts", {}).get(self.tag(job), f"{self.tag(job)}.sh")
 
         if shfile.exists():
-            return rich.syntax.Syntax(
-                shfile.read_text().strip("\n"),
-                lexer="sh",
-                theme=ANSITheme(),
-            )
+            return shfile.read_text().strip("\n")
         else:
             return None
 
-    def report(
-        self, job: Job | int | None = None, i: int | None = None, **kwargs
-    ) -> list[rich.console.RenderableType]:
-        if job is None:
-            table = rich.table.Table(box=rich.box.ROUNDED)
-            table.add_column("", justify="right", no_wrap=True, min_width=2)
-            table.add_column("Job", justify="left", no_wrap=True)
-            table.add_column("State", justify="left", no_wrap=True)
-            table.add_column("ID", justify="right", no_wrap=True)
+    # Submission
 
-            for job, i in self.order.items():  # noqa: PLR1704
-                if job in self.traces:
-                    jobid = None
-                else:
-                    jobid = self.results[job]
+    def run(self, jobs: list[Job]) -> None:
+        (self.path / "run.py").write_text(runner(import_paths()))
 
-                table.add_row(str(i), str(job), self.lookup(job, entry="state"), jobid)
+        units = self.units(jobs) if self.pack else [[job] for job in jobs]
 
-            return [table]
+        try:
+            asyncio.run(self._submit_all(units))
+        finally:
+            # Also record partial submissions (e.g. interrupted by Ctrl-C)
+            self.record()
+
+    def units(self, jobs: list[Job]) -> list[list[Job]]:
+        r"""Groups independent jobs with identical settings and dependencies into packs.
+
+        A pack is submitted as a single job array, where each dawgz job is one array
+        task. This reduces the number of `sbatch` calls (and the load on the Slurm
+        controller) without changing the semantics of the workflow.
+        """
+
+        groups: dict[tuple, list[Job]] = {}
+        units: list[list[Job]] = []
+
+        for job in jobs:
+            if isinstance(job, JobArray):
+                units.append([job])
+                continue
+
+            key = (
+                job.shell,
+                job.interpreter,
+                tuple(job.env),
+                tuple(sorted(job.settings.items(), key=str)),
+                tuple(sorted((self.order[d], s) for d, s in job.dependencies.items())),
+                job.wait_mode,
+                bool(job.satisfied),
+                bool(job.unsatisfied),
+            )
+
+            if key in groups and len(groups[key]) < MAX_PACK:
+                groups[key].append(job)
+            else:
+                groups[key] = [job]
+                units.append(groups[key])
+
+        return units
+
+    async def _submit_all(self, units: list[list[Job]]) -> None:
+        self.semaphore = asyncio.Semaphore(self.concurrency)
+        self.unit_of = {job: (k, j) for k, unit in enumerate(units) for j, job in enumerate(unit)}
+        self.tasks = [asyncio.ensure_future(self._submit(unit)) for unit in units]
+        self.units_ = units
+
+        try:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+        finally:
+            del self.tasks, self.semaphore, self.unit_of, self.units_
+
+    async def _submit(self, unit: list[Job]) -> list[str]:
+        try:
+            jobids = await self._exec(unit)
+        except BaseException as e:
+            for job in unit:
+                self.traces[job] = trace(e)
+            raise
         else:
-            return super().report(job, i, **kwargs)
+            for job, jobid in zip(unit, jobids, strict=True):
+                self.results[job] = jobid
+            return jobids
 
-    def cancel(self, job: Job | int | None = None, i: int | None = None) -> str:
-        if job is None:
-            jobids = list(self.results.values())
+    async def _jobid(self, dep: Job) -> str | BaseException:
+        k, j = self.unit_of[dep]
+        try:
+            return (await asyncio.shield(self.tasks[k]))[j]
+        except BaseException as e:
+            return e
+
+    async def _exec(self, unit: list[Job]) -> list[str]:
+        job = unit[0]
+
+        # Dependencies (shared by all jobs of the unit)
+        deps = list(job.dependencies.items())
+        results = await asyncio.gather(*(self._jobid(dep) for dep, _ in deps))
+
+        submitted = [
+            (dep, status, jobid)
+            for (dep, status), jobid in zip(deps, results, strict=True)
+            if isinstance(jobid, str)
+        ]
+        failed = [
+            dep
+            for (dep, _), jobid in zip(deps, results, strict=True)
+            if not isinstance(jobid, str)
+        ]
+
+        if job.wait_mode == "all":
+            if failed or job.unsatisfied:
+                raise JobNeverSatisfiedError(repr(job))
+        elif job.satisfied:
+            submitted = []  # already satisfied by a pruned dependency
+        elif (deps or job.unsatisfied) and not submitted:
+            raise JobNeverSatisfiedError(repr(job))
+
+        name = self.unit_name(unit)
+        loop = asyncio.get_running_loop()
+
+        if len(unit) > 1:
+            for j in unit:
+                self.scripts[self.tag(j)] = f"{name}.sh"
+
+        # Files
+        shfile = self.path / f"{name}.sh"
+        script = self.script(unit, submitted)
+        await loop.run_in_executor(None, self._write_files, unit, name, shfile, script)
+
+        # Submission
+        async with self.semaphore:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "sbatch",
+                    "--parsable",
+                    str(shfile),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+            except OSError as e:
+                raise JobSubmissionError(repr(job)) from e
+
+        if proc.returncode != 0:
+            error = RuntimeError(stderr.decode(errors="replace").strip("\n"))
+            raise JobSubmissionError(repr(job)) from error
+
+        jobid, *_ = stdout.decode().strip("\n").split(";")  # ignore cluster name
+
+        if len(unit) > 1:
+            return [f"{jobid}_{j}" for j in range(len(unit))]
         else:
-            if isinstance(job, int):
-                job = list(self.order)[job]
-            jobid = self.results[job]
-            if i is not None:  # noop if job is not array
-                jobid = f"{jobid}_{i}"
-            jobids = [jobid]
+            return [jobid]
 
-        return subprocess.run(
-            ["scancel", "-v", *jobids],
-            capture_output=True,
-            check=True,
-            text=True,
-        ).stderr.strip("\n")
+    def unit_name(self, unit: list[Job]) -> str:
+        return self.tag(unit[0]) + (".pack" if len(unit) > 1 else "")
 
-    async def satisfy(self, job: Job) -> str:
-        results = await asyncio.gather(*map(self.submit, job.dependencies))
+    def _write_files(self, unit: list[Job], name: str, shfile: Path, script: str) -> None:
+        job = unit[0]
 
-        for result in results:
-            if isinstance(result, Exception):
-                raise JobNeverSatisfiedError(repr(job)) from result
+        if len(unit) > 1:
+            with open(self.path / f"{name}.pkl", "wb") as f:
+                bytes_dump(f, [j.pkl for j in unit])
+            store.write_json(self.path / f"{name}.json", [self.tag(j) for j in unit])
+        elif isinstance(job, JobArray):
+            with open(self.path / f"{name}.pkl", "wb") as f:
+                bytes_dump(f, [job[i].pkl for i in range(len(job))])
+        else:
+            (self.path / f"{name}.pkl").write_bytes(job.pkl)
 
-    async def exec(self, job: Job) -> str:
-        loop = asyncio.get_event_loop()
+        shfile.write_text(script)
 
+    def dependency(self, job: Job, deps: list[tuple[Job, str, str]]) -> str:
+        after = {
+            "success": "afterok",
+            "failure": "afternotok",
+            "any": "afterany",
+        }
+
+        items = []
+        covered = set()
+
+        if job.wait_mode == "all":
+            # A dependency on all tasks of a pack is a dependency on the array
+            by_unit: dict[int, list] = {}
+            for dep, status, jobid in deps:
+                by_unit.setdefault(self.unit_of[dep][0], []).append((dep, status, jobid))
+
+            for k, items_k in by_unit.items():
+                unit = self.units_[k]
+                statuses = {status for _, status, _ in items_k}
+                if (
+                    len(unit) > 1
+                    and len(items_k) == len(unit)
+                    and statuses in ({"success"}, {"any"})
+                ):
+                    arrayid = items_k[0][2].split("_")[0]
+                    items.append(f"{after[items_k[0][1]]}:{arrayid}")
+                    covered.update(dep for dep, _, _ in items_k)
+
+        for dep, status, jobid in deps:
+            if dep not in covered:
+                items.append(f"{after[status]}:{jobid}")
+
+        return ("?" if job.wait_mode == "any" else ",").join(items)
+
+    def script(self, unit: list[Job], deps: list[tuple[Job, str, str]]) -> str:
+        job = unit[0]
         tag = self.tag(job)
-        logfile = self.path / (f"{tag}_%a.log" if isinstance(job, JobArray) else f"{tag}.log")
-        pklfile = self.path / f"{tag}.pkl"
-        pyfile = self.path / f"{tag}.py"
-        shfile = self.path / f"{tag}.sh"
+        name = self.unit_name(unit)
+        folder = str(self.path).replace("%", "%%")  # escape Slurm filename patterns
 
-        # Submission script
+        if len(unit) > 1:
+            logfile = f"{folder}/{name}_%a.out"
+        elif isinstance(job, JobArray):
+            logfile = f"{folder}/{tag}_%a.log"
+        else:
+            logfile = f"{folder}/{tag}.log"
+
+        if " " in logfile:
+            logfile = f'"{logfile}"'
+
         lines = [
             f"#!{job.shell}",
             "#",
-            f"#SBATCH --job-name={tag}",
+            f"#SBATCH --job-name={tag}" + (f"+{len(unit) - 1}" if len(unit) > 1 else ""),
         ]
 
-        if isinstance(job, JobArray):
+        if len(unit) > 1:
+            lines.append(f"#SBATCH --array=0-{len(unit) - 1}")
+        elif isinstance(job, JobArray):
             if job.throttle is None:
                 lines.append(f"#SBATCH --array=0-{len(job) - 1}")
             else:
@@ -167,40 +357,39 @@ class SlurmScheduler(Scheduler):
         lines.append("#")
 
         ## Settings
-        if job.settings:
-            settings = {
-                self.translate.get(k, k).replace("_", "-"): v for k, v in job.settings.items()
-            }
-        else:
-            settings = {}
+        settings = {self.translate.get(k, k).replace("_", "-"): v for k, v in job.settings.items()}
 
-        assert "clusters" not in settings, "multi-cluster jobs not supported"
+        if "clusters" in settings:
+            raise ValueError("multi-cluster jobs are not supported")
+
+        for a, b in (
+            ("ram", "memory"),
+            ("time", "timeout"),
+            ("time", "timelimit"),
+            ("timeout", "timelimit"),
+        ):
+            if a in job.settings and b in job.settings:
+                raise ValueError(f"conflicting settings '{a}' and '{b}' for job {job}")
 
         if "ntasks" not in settings:
             settings.setdefault("nodes", 1)
             settings.setdefault("ntasks-per-node", 1)
 
+        if deps:
+            settings.setdefault("kill-on-invalid-dep", "yes")
+
         for key, value in sorted(settings.items()):
-            if isinstance(value, bool) and value:
+            if value is True:
                 lines.append(f"#SBATCH --{key}")
+            elif value is False or value is None:
+                continue
             else:
                 lines.append(f"#SBATCH --{key}={value}")
 
         ## Dependencies
-        sep = "?" if job.wait_mode == "any" else ","
-        after = {
-            "success": "afterok",
-            "failure": "afternotok",
-            "any": "afterany",
-        }
-
-        deps = [
-            f"{after[status]}:{await self.submit(dep)}" for dep, status in job.dependencies.items()
-        ]
-
         if deps:
             lines.append("#")
-            lines.append("#SBATCH --dependency=" + sep.join(deps))
+            lines.append("#SBATCH --dependency=" + self.dependency(job, deps))
 
         lines.append("")
 
@@ -210,56 +399,25 @@ class SlurmScheduler(Scheduler):
             lines.append("")
 
         ## Interpreter
-        lines.append(f"srun {job.interpreter} {pyfile}")
+        runner = shlex.quote(str(self.path / "run.py"))
+        target = f"--pack {name}" if len(unit) > 1 else tag
+        lines.append(f"srun {job.interpreter} {runner} {target}")
         lines.append("")
 
-        await loop.run_in_executor(None, shfile.write_text, "\n".join(lines))
+        return "\n".join(lines)
 
-        # Pickle files
-        if isinstance(job, JobArray):
-            pklfile = str(pklfile).replace(".pkl", "_{}.pkl")
 
-            await asyncio.wait([
-                loop.run_in_executor(None, Path(pklfile.format(i)).write_bytes, job[i].pkl)
-                for i in range(len(job))
-            ])
+def import_paths() -> list[str]:
+    r"""Returns the directories from which the jobs' modules should be importable."""
 
-            pycode = [
-                "#!/usr/bin/env python",
-                "import os",
-                "import pickle",
-                "i = os.environ['SLURM_ARRAY_TASK_ID']",
-                f"with open('{pklfile}'.format(i), 'rb') as f:",
-                "    pickle.load(f)()",
-                "",
-            ]
-        else:
-            await loop.run_in_executor(None, pklfile.write_bytes, job.pkl)
+    import __main__
 
-            pycode = [
-                "#!/usr/bin/env python",
-                "import pickle",
-                f"with open('{pklfile}', 'rb') as f:",
-                "    pickle.load(f)()",
-                "",
-            ]
+    paths = []
+    main = getattr(__main__, "__file__", None)
 
-        await loop.run_in_executor(None, pyfile.write_text, "\n".join(pycode))
+    if main:
+        paths.append(os.path.dirname(os.path.abspath(main)))
 
-        # Submit script
-        try:
-            text = subprocess.run(
-                ["sbatch", "--parsable", str(shfile)],
-                capture_output=True,
-                check=True,
-                text=True,
-            ).stdout
+    paths.append(os.getcwd())
 
-            jobid, *_ = text.strip("\n").split(";")  # ignore cluster name
-
-            return jobid
-        except Exception as e:
-            if isinstance(e, subprocess.CalledProcessError):
-                e = subprocess.SubprocessError(e.stderr.strip("\n"))
-
-            raise JobSubmissionError(repr(job)) from e
+    return list(dict.fromkeys(paths))

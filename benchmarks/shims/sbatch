@@ -1,0 +1,12 @@
+#!/bin/bash
+# Benchmark shim: pretends to submit a job after a fixed latency.
+set -e
+: "${FAKESLURM_DIR:?FAKESLURM_DIR must be set}"
+sleep "${FAKESLURM_DELAY:-0.05}"
+echo "sbatch $*" >> "$FAKESLURM_DIR/calls"
+exec 9>>"$FAKESLURM_DIR/lock"
+flock 9
+n=$(cat "$FAKESLURM_DIR/counter" 2>/dev/null || echo 1000)
+n=$((n + 1))
+echo "$n" > "$FAKESLURM_DIR/counter"
+echo "$n"

@@ -1,25 +1,25 @@
 r"""Miscellaneous helpers"""
 
-import asyncio
-import cloudpickle as pickle
 import inspect
 import mmap
+import os
 import re
 import struct
 import sys
 import traceback
-import uuid
 
 from pathlib import Path
 from typing import IO, Any, overload
-from wonderwords import RandomWord
 
 BYTES_HEADER = b"BYTES_LIST"
 BYTES_U64 = struct.Struct("<Q")
 
 
-def as_scalar(x: Any) -> bool | int | float | str:
+def as_scalar(x: Any) -> bool | int | float | str | None:
     r"""Casts a value to a built-in scalar type."""
+
+    if x is None:
+        return None
 
     for T in (bool, int, float, str):
         if isinstance(x, T):
@@ -99,8 +99,10 @@ def eprint(*args, **kwargs) -> None:
     print(*args, file=sys.stderr, **kwargs)
 
 
-def future(obj: Any, return_exceptions: bool = False) -> asyncio.Future:
+def future(obj: Any, return_exceptions: bool = False) -> Any:
     r"""Transforms any object to an awaitable future."""
+
+    import asyncio
 
     if inspect.isawaitable(obj):
         if return_exceptions:
@@ -124,25 +126,28 @@ def future(obj: Any, return_exceptions: bool = False) -> asyncio.Future:
 
 
 def human_uuid() -> str:
-    r"""Returns a human-readable UUID."""
+    r"""Returns a human-readable UUID, such as `brave_otter_3f2a9c1d`."""
 
-    adjective = RandomWord().word(
-        word_min_length=6,
-        word_max_length=8,
-        include_categories=["adjectives"],
-        exclude_with_spaces=True,
-    )
+    import random
 
-    noun = RandomWord().word(
-        word_min_length=14 - len(adjective),
-        word_max_length=14 - len(adjective),
-        include_categories=["nouns"],
-        exclude_with_spaces=True,
-    )
+    from .words import ADJECTIVES, NOUNS
 
-    hex = uuid.uuid4().hex[:8]
+    rng = random.SystemRandom()
 
-    return f"{adjective}_{noun}_{hex}"
+    return f"{rng.choice(ADJECTIVES)}_{rng.choice(NOUNS)}_{os.urandom(4).hex()}"
+
+
+def pretty(x: object, width: int = 88) -> str:
+    r"""Returns a readable representation of an object, indented if it is long."""
+
+    text = repr(x)
+
+    if len(text) <= width or "\n" in text:
+        return text
+
+    import pprint
+
+    return pprint.pformat(x, indent=1, width=width, sort_dicts=False)
 
 
 def runpickle(
@@ -164,7 +169,7 @@ def runpickle(
             sys.stderr = TeeStream(sys.stderr, f)
 
             try:
-                pickle.loads(data)(*args, **kwargs)
+                _loads(data)(*args, **kwargs)
             except Exception as e:
                 print(trace(e, patterns=["runpickle"]), file=sys.stderr)
                 raise
@@ -172,7 +177,13 @@ def runpickle(
                 sys.stdout = sys.stdout.parent
                 sys.stderr = sys.stderr.parent
     else:
-        pickle.loads(data)(*args, **kwargs)
+        _loads(data)(*args, **kwargs)
+
+
+def _loads(data: bytes) -> Any:
+    import pickle
+
+    return pickle.loads(data)
 
 
 def slugify(text: str) -> str:

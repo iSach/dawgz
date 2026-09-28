@@ -1,0 +1,3 @@
+#!/bin/bash
+: "${FAKESLURM_DIR:?FAKESLURM_DIR must be set}"
+echo "scancel $*" >> "$FAKESLURM_DIR/calls"
