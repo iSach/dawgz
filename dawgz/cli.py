@@ -999,6 +999,9 @@ def cmd_tui(args: argparse.Namespace, extra: list[str]) -> int:
             "or put a `dawgz-tui` binary on your PATH."
         )
 
+    if args.offline:
+        extra = ["--offline", *extra]
+
     os.execv(binary, [binary, "--dir", str(args.dir), *extra])
 
 
