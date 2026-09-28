@@ -66,7 +66,9 @@ if __name__ == "__main__":
 def run(cmd: list[str], env: dict, calls: Path) -> dict:
     before = calls.read_text().count("sacct") if calls.exists() else 0
     start = time.perf_counter()
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    # From the temporary directory, such that `python -m dawgz` never imports a
+    # `dawgz` package of the current directory instead of the installed one
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=calls.parent.parent)
     seconds = time.perf_counter() - start
     after = calls.read_text().count("sacct") if calls.exists() else 0
 
