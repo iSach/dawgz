@@ -361,3 +361,46 @@ def test_watch_mode_is_bounded(
     code, out, _ = run(capsys, "0", "--watch", "1")
     assert code == 0
     assert out.count("noop") >= 2
+
+
+def test_cancel_local(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    import os
+    import subprocess
+
+    script = tmp_path / "long.py"
+    script.write_text(
+        "import time\n"
+        "import dawgz\n"
+        "@dawgz.job\n"
+        "def nap(i):\n"
+        "    time.sleep(60)\n"
+        "dawgz.schedule(*nap.map(range(3)), backend='local', workers=2, quiet=True)\n"
+    )
+    env = {**os.environ, "DAWGZ_DIR": str(dawgz.get_dawgz_dir())}
+    proc = subprocess.Popen([sys.executable, str(script)], env=env)
+
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            rows = store.registry(dawgz.get_dawgz_dir())
+            if (
+                rows
+                and len(list((dawgz.get_dawgz_dir() / rows[0]["uid"]).glob("*.run.json"))) == 2
+            ):
+                break
+            time.sleep(0.1)
+
+        code, out, _ = run(capsys, "cancel", "0")
+        assert code == 0
+        assert "SIGTERM" in out
+
+        proc.wait(timeout=20)
+    finally:
+        proc.kill()
+
+    _, out, _ = run(capsys, "0", "--json")
+    states = [j["summary"]["state"] for j in json.loads(out)["jobs"]]
+    assert states == ["CANCELLED"] * 3
+
+    _, out, _ = run(capsys, "cancel", "0")
+    assert "nothing to cancel" in out
