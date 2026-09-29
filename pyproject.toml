@@ -18,8 +18,6 @@ classifiers = [
 ]
 dependencies = [
   "cloudpickle>=2.0.0",
-  "rich>=13.8.0",
-  "wonderwords>=3.0.0",
 ]
 dynamic = ["version"]
 keywords = ["workflow", "scheduling", "slurm", "hpc"]
@@ -34,10 +32,11 @@ dev = [
 ]
 test = [
   "pytest>=8.0.0",
+  "tqdm>=4.60",
 ]
 
 [project.scripts]
-dawgz = "dawgz.__main__:main"
+dawgz = "dawgz.cli:main"
 
 [project.urls]
 documentation = "https://github.com/francois-rozet/dawgz"

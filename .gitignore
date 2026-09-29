@@ -164,3 +164,6 @@ cython_debug/
 
 # Pickle
 *.pkl
+
+# Rust
+tui/target/

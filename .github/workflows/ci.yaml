@@ -32,3 +32,28 @@ jobs:
           pip install .[test]
       - name: Run tests
         run: pytest tests
+  tui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        working-directory: tui
+        run: cargo build --release --locked
+      - name: Lint
+        working-directory: tui
+        run: |
+          cargo fmt --check
+          cargo clippy --release --all-targets -- -D warnings
+      - name: Test
+        working-directory: tui
+        run: cargo test --release
+      - name: Contract tests with the Python records
+        run: |
+          pip install .[test]
+          pytest tests/test_tui.py

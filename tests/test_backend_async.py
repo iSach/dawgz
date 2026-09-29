@@ -276,3 +276,26 @@ def test_blocked_by_failed_array() -> None:
     assert scheduler.state(array) == "FAILED"
     assert "JobNeverSatisfiedError" in scheduler.logs(y_job)
     assert scheduler.state(y_job) == "CANCELLED"
+
+
+def test_crash_does_not_affect_others() -> None:
+    import os
+    import signal
+
+    @dawgz.job
+    def crash() -> None:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    @dawgz.job
+    def leave() -> None:
+        os._exit(3)
+
+    crash_job, leave_job = crash(), leave()
+    others = [echo(i) for i in range(3)]
+
+    scheduler = dawgz.schedule(crash_job, leave_job, *others, backend="local", workers=2)
+
+    assert scheduler.state(crash_job) == "FAILED"
+    assert scheduler.state(leave_job) == "FAILED"
+    for job in others:
+        assert scheduler.state(job) == "COMPLETED"

@@ -1,0 +1,17 @@
+#!/bin/bash
+# Benchmark shim: reports every requested job as PENDING after a fixed latency.
+: "${FAKESLURM_DIR:?FAKESLURM_DIR must be set}"
+sleep "${FAKESLURM_DELAY:-0.05}"
+echo "sacct $*" >> "$FAKESLURM_DIR/calls"
+ids=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -j|--jobs) ids="$2"; shift ;;
+    --jobs=*) ids="${1#--jobs=}" ;;
+  esac
+  shift
+done
+IFS=',' read -ra arr <<< "$ids"
+for id in "${arr[@]}"; do
+  echo "$id|PENDING"
+done
