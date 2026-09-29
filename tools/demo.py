@@ -149,12 +149,11 @@ def main() -> None:
     lines += [f"set -gx {k} {fish_quote(env[k])}" for k in variables]
     (root / "env.fish").write_text("\n".join(lines) + "\n")
 
-    fish = os.path.basename(os.environ.get("SHELL", "")) == "fish" or "FISH_VERSION" in os.environ
-    envfile = root / ("env.fish" if fish else "env.sh")
-
+    # The shell cannot be detected reliably (e.g. fish started from a bash login)
     print(f"\nDemo workflows are running on a fake Slurm in {root}")
     print("Explore them with:\n")
-    print(f"  source {envfile}")
+    print(f"  source {root / 'env.sh'}    # bash, zsh")
+    print(f"  source {root / 'env.fish'}  # fish")
     print("  dawgz")
     print("  dawgz tui")
 
