@@ -116,6 +116,6 @@ To try it without a cluster, [`tools/demo.py`](../tools/demo.py) runs it (and a 
 
 ```
 python tools/demo.py /tmp/demo
-source /tmp/demo/env.sh
+source /tmp/demo/env.sh  # or env.fish
 dawgz tui
 ```

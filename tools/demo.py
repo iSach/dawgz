@@ -100,6 +100,11 @@ if __name__ == "__main__":
 """
 
 
+def fish_quote(value: object) -> str:
+    text = str(value).replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{text}'"
+
+
 def main() -> None:
     root = Path(
         sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="dawgz-demo-")
@@ -131,16 +136,25 @@ def main() -> None:
     for script in ("prepare.py", "timeout.py", "sweep.py", "showcase.py"):
         subprocess.run([sys.executable, script], cwd=root, env=env, check=True)
 
-    # Environment to explore the demo (the fake Slurm comes first in PATH)
+    # Environment to explore the demo (the fake Slurm comes first in PATH), for POSIX
+    # shells (bash, zsh) and fish
     tui = REPO / "tui" / "target" / "release"
+    variables = ("FAKESLURM_DIR", "FAKESLURM_EXEC", "DAWGZ_DIR")
+
     lines = [f"export PATH={shlex.quote(f'{FAKESLURM}:{python}:{tui}')}:$PATH"]
-    for k in ("FAKESLURM_DIR", "FAKESLURM_EXEC", "DAWGZ_DIR"):
-        lines.append(f"export {k}={shlex.quote(env[k])}")
+    lines += [f"export {k}={shlex.quote(env[k])}" for k in variables]
     (root / "env.sh").write_text("\n".join(lines) + "\n")
+
+    lines = [f"set -gx PATH {fish_quote(FAKESLURM)} {fish_quote(python)} {fish_quote(tui)} $PATH"]
+    lines += [f"set -gx {k} {fish_quote(env[k])}" for k in variables]
+    (root / "env.fish").write_text("\n".join(lines) + "\n")
+
+    fish = os.path.basename(os.environ.get("SHELL", "")) == "fish" or "FISH_VERSION" in os.environ
+    envfile = root / ("env.fish" if fish else "env.sh")
 
     print(f"\nDemo workflows are running on a fake Slurm in {root}")
     print("Explore them with:\n")
-    print(f"  source {root / 'env.sh'}")
+    print(f"  source {envfile}")
     print("  dawgz")
     print("  dawgz tui")
 

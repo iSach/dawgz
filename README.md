@@ -317,5 +317,5 @@ uv venv && uv pip install -e ".[test,dev]"
 pytest tests                   # uses the fake Slurm of tools/fakeslurm, never a real cluster
 cd tui && cargo test && cargo clippy
 python tools/demo.py /tmp/demo # demo workflows on a fake Slurm, to try the CLI and TUI
-source /tmp/demo/env.sh && dawgz tui
+source /tmp/demo/env.sh && dawgz tui   # or env.fish
 ```
